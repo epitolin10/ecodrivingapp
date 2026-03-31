@@ -50,9 +50,51 @@ class _MapScreenState extends State<MapScreen> {
           Marker(
             key: const ValueKey('current'),
             point: pos,
-            width: 48,
-            height: 48,
-            child: const Icon(Icons.my_location, color: Colors.blue, size: 36),
+            width: 60,
+            height: 60,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                // Halo de précision (cercle externe semi-transparent)
+                Container(
+                  width: 60,
+                  height: 60,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.blue.withOpacity(0.15),
+                    border: Border.all(
+                      color: Colors.blue.withOpacity(0.25),
+                      width: 1,
+                    ),
+                  ),
+                ),
+                // Anneau blanc avec ombre
+                Container(
+                  width: 22,
+                  height: 22,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.white,
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black26,
+                        blurRadius: 6,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                ),
+                // Point bleu central
+                Container(
+                  width: 14,
+                  height: 14,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Color(0xFF1A73E8),
+                  ),
+                ),
+              ],
+            ),
           ),
         ];
       });
