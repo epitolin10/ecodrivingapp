@@ -2,17 +2,16 @@ import 'package:flutter/material.dart';
 import 'models/vehicle_profile.dart';
 import 'screens/mapscreen.dart';
 import 'screens/vehicle_setup_screen.dart';
+import 'screens/splash_screen.dart';
+import 'screens/hub_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final profile = await VehicleProfile.load();
-  runApp(MainApp(vehicleProfile: profile));
+  runApp(const MainApp());
 }
 
 class MainApp extends StatelessWidget {
-  final VehicleProfile? vehicleProfile;
-
-  const MainApp({super.key, this.vehicleProfile});
+  const MainApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -26,9 +25,20 @@ class MainApp extends StatelessWidget {
         ),
         fontFamily: 'Roboto',
       ),
-      home: vehicleProfile != null
-          ? MapScreen(vehicleProfile: vehicleProfile!)
-          : const VehicleSetupScreen(),
+      home: const SplashScreen(),
+      routes: {
+        '/map': (context) {
+          final args =
+              ModalRoute.of(context)?.settings.arguments as VehicleProfile?;
+          return MapScreen(vehicleProfile: args!);
+        },
+        '/setup': (context) => const VehicleSetupScreen(),
+        '/hub': (context) {
+          final args =
+              ModalRoute.of(context)?.settings.arguments as VehicleProfile?;
+          return HubScreen(vehicleProfile: args);
+        },
+      },
     );
   }
 }

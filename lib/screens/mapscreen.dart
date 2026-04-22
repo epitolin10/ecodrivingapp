@@ -5,7 +5,6 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import '../models/vehicle_profile.dart';
-import '../services/fuel_price_service.dart';
 import '../services/gpsservice.dart';
 
 class MapScreen extends StatefulWidget {
@@ -40,8 +39,12 @@ class _MapScreenState extends State<MapScreen> {
   // Vrai si la carte suit automatiquement le GPS pendant la navigation
   bool _isFollowing = false;
 
+  // Drapeau pour autoriser le recentrage automatique
+  bool _shouldAutoFollow = false;
+
   // Dernière position utilisée pour recentrer (évite les micro-mouvements)
   LatLng? _lastFollowedPosition;
+  double _speedKmh = 0.0;
 
   // Synthèse vocale
   final FlutterTts _tts = FlutterTts();
@@ -59,15 +62,6 @@ class _MapScreenState extends State<MapScreen> {
     super.initState();
     _initTts();
     _initLocation();
-    _loadFuelPrice();
-  }
-
-  Future<void> _loadFuelPrice() async {
-    if (widget.vehicleProfile == null) return;
-    final price = await FuelPriceService.fetchPricePerLiter(
-      isDiesel: widget.vehicleProfile!.fuelType == FuelType.diesel,
-    );
-    if (mounted) setState(() => _fuelPricePerLiter = price);
   }
 
   Future<void> _initTts() async {
@@ -92,14 +86,29 @@ class _MapScreenState extends State<MapScreen> {
 
   Future<void> _initLocation() async {
     final granted = await GpsService.checkAndRequestPermission();
-    if (!granted) return;
+    if (!granted) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Permission de localisation refusée. L\'application ne peut pas fonctionner sans elle.',
+            ),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+      return;
+    }
     GpsService.getPositionStream().listen((Position position) {
       if (!mounted) return;
       final pos = LatLng(position.latitude, position.longitude);
       final bearing = position.heading;
+      final speedKmh = (position.speed * 3.6).clamp(0.0, 300.0);
       setState(() {
         _currentPosition = pos;
         _bearing = bearing;
+        _speedKmh = speedKmh;
         _markers = [
           ..._markers.where((m) => m.key != const ValueKey('current')),
           Marker(
@@ -155,7 +164,7 @@ class _MapScreenState extends State<MapScreen> {
           ),
         ];
       });
-      // Recentre : mode libre ou navigation active (si suivi actif)
+      // Recentre : uniquement si le suivi automatique est activé pendant la navigation
       // Seuil de 10 m pour éviter les micro-mouvements GPS
       final double _movedDist = _lastFollowedPosition == null
           ? double.infinity
@@ -165,11 +174,8 @@ class _MapScreenState extends State<MapScreen> {
               pos.latitude,
               pos.longitude,
             );
-      if (_movedDist >= 10.0) {
-        if (_routeAlternatives.isEmpty) {
-          _mapController.move(pos, 15.0);
-          _lastFollowedPosition = pos;
-        } else if (_routeValidated && _isFollowing) {
+      if (_shouldAutoFollow && _movedDist >= 10.0) {
+        if (_routeValidated && _isFollowing) {
           _mapController.move(pos, 17.0);
           _lastFollowedPosition = pos;
         }
@@ -178,6 +184,44 @@ class _MapScreenState extends State<MapScreen> {
       // Avancement automatique des étapes de navigation + annonces vocales
       if (_routeValidated && _routeAlternatives.isNotEmpty) {
         final steps = _routeAlternatives[_selectedRouteIndex].steps;
+
+        // ── NOUVEAU : recalage sur l'étape la plus proche ──────────────
+        // Cherche parmi les étapes restantes celle dont le point
+        // est le plus proche de la position actuelle
+        if (steps.length > 2) {
+          int bestIdx = _navStepIndex;
+          double bestDist = double.infinity;
+
+          // On cherche dans une fenêtre : étape actuelle ± 5
+          final searchFrom = (_navStepIndex - 1).clamp(1, steps.length - 1);
+          final searchTo = (_navStepIndex + 5).clamp(1, steps.length - 1);
+
+          for (int i = searchFrom; i <= searchTo; i++) {
+            final d = Geolocator.distanceBetween(
+              pos.latitude,
+              pos.longitude,
+              steps[i].location.latitude,
+              steps[i].location.longitude,
+            );
+            if (d < bestDist) {
+              bestDist = d;
+              bestIdx = i;
+            }
+          }
+
+          // Si on a trouvé une étape plus pertinente (et qu'on ne recule pas
+          // de plus d'une étape pour éviter les faux positifs)
+          if (bestIdx != _navStepIndex && bestIdx >= _navStepIndex - 1) {
+            setState(() {
+              _navStepIndex = bestIdx;
+              _announced300 = false;
+              _announced100 = false;
+            });
+            _speak(_stepInstructionShort(steps[bestIdx]));
+          }
+        }
+        // ── FIN recalage ───────────────────────────────────────────────
+
         if (_navStepIndex < steps.length - 1) {
           final target = steps[_navStepIndex].location;
           final dist = Geolocator.distanceBetween(
@@ -186,11 +230,13 @@ class _MapScreenState extends State<MapScreen> {
             target.latitude,
             target.longitude,
           );
+
           // Annonce à 300 m
           if (dist <= 300 && !_announced300) {
             _announced300 = true;
             _speak(
-              'Dans ${_formatDistance(dist / 1000)}, ${_stepInstructionShort(steps[_navStepIndex])}',
+              'Dans ${_formatDistance(dist / 1000)}, '
+              '${_stepInstructionShort(steps[_navStepIndex])}',
             );
           }
           // Annonce à 100 m
@@ -198,8 +244,8 @@ class _MapScreenState extends State<MapScreen> {
             _announced100 = true;
             _speak('Bientôt, ${_stepInstructionShort(steps[_navStepIndex])}');
           }
-          // Passage à l'étape suivante
-          if (dist < 30 && mounted) {
+          // Passage à l'étape suivante (seuil abaissé à 20 m pour plus de réactivité)
+          if (dist < 20 && mounted) {
             final nextIdx = _navStepIndex + 1;
             setState(() {
               _navStepIndex = nextIdx;
@@ -228,9 +274,16 @@ class _MapScreenState extends State<MapScreen> {
         _searchResults = results;
         _isSearching = false;
       });
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
       setState(() => _isSearching = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Erreur de recherche: ${e.toString()}'),
+          backgroundColor: Colors.orange,
+          duration: const Duration(seconds: 3),
+        ),
+      );
     }
   }
 
@@ -298,12 +351,63 @@ class _MapScreenState extends State<MapScreen> {
       _selectedRouteIndex = 0;
       _routeValidated = false;
       _isFollowing = false;
+      _shouldAutoFollow = false;
       _navStepIndex = 1;
       _announced300 = false;
       _announced100 = false;
-      _markers = _markers
-          .where((m) => m.key != const ValueKey('search'))
-          .toList();
+      // Recréer le marqueur GPS normal
+      _markers = [
+        ..._markers.where((m) => m.key != const ValueKey('search')),
+        Marker(
+          key: const ValueKey('current'),
+          point: _currentPosition,
+          width: 60,
+          height: 60,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // Halo de précision (cercle externe semi-transparent)
+              Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.blue.withOpacity(0.15),
+                  border: Border.all(
+                    color: Colors.blue.withOpacity(0.25),
+                    width: 1,
+                  ),
+                ),
+              ),
+              // Anneau blanc avec ombre
+              Container(
+                width: 22,
+                height: 22,
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Colors.white,
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black26,
+                      blurRadius: 6,
+                      offset: Offset(0, 2),
+                    ),
+                  ],
+                ),
+              ),
+              // Point bleu central
+              Container(
+                width: 14,
+                height: 14,
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: Color(0xFF1A73E8),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ];
     });
     _mapController.move(_currentPosition, 15.0);
   }
@@ -313,6 +417,7 @@ class _MapScreenState extends State<MapScreen> {
     setState(() {
       _routeValidated = true;
       _isFollowing = true;
+      _shouldAutoFollow = true;
       _navStepIndex = steps.length > 1 ? 1 : 0;
       _announced300 = false;
       _announced100 = false;
@@ -334,6 +439,15 @@ class _MapScreenState extends State<MapScreen> {
     if (steps.isNotEmpty) {
       _speak(_stepInstructionShort(steps[startIdx]));
     }
+  }
+
+  void _focusOnLocation() {
+    setState(() {
+      _isFollowing = true;
+      _shouldAutoFollow = true;
+    });
+    _mapController.move(_currentPosition, _routeValidated ? 17.0 : 15.0);
+    _lastFollowedPosition = _currentPosition;
   }
 
   Widget _buildArrowMarker(double bearingDeg) {
@@ -422,7 +536,10 @@ class _MapScreenState extends State<MapScreen> {
               maxZoom: 19,
               onPositionChanged: (camera, hasGesture) {
                 if (hasGesture && _routeValidated && _isFollowing) {
-                  setState(() => _isFollowing = false);
+                  setState(() {
+                    _isFollowing = false;
+                    _shouldAutoFollow = false;
+                  });
                 }
               },
               onTap: (tapPosition, latlng) {
@@ -473,49 +590,73 @@ class _MapScreenState extends State<MapScreen> {
                             ),
                           ],
                         ),
-                        child: TextField(
-                          controller: _searchController,
-                          decoration: InputDecoration(
-                            hintText: 'Rechercher une destination...',
-                            hintStyle: TextStyle(color: Colors.grey.shade500),
-                            prefixIcon: Icon(
-                              Icons.search_rounded,
+                        child: Row(
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.menu_rounded),
                               color: Colors.grey.shade600,
+                              onPressed: () {
+                                Navigator.of(context).pushNamed(
+                                  '/hub',
+                                  arguments: widget.vehicleProfile,
+                                );
+                              },
                             ),
-                            suffixIcon: _isSearching
-                                ? const Padding(
-                                    padding: EdgeInsets.all(12),
-                                    child: SizedBox(
-                                      width: 20,
-                                      height: 20,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
-                                    ),
-                                  )
-                                : _searchController.text.isNotEmpty
-                                ? IconButton(
-                                    icon: Icon(
-                                      Icons.clear_rounded,
-                                      color: Colors.grey.shade600,
-                                    ),
-                                    onPressed: () {
-                                      _searchController.clear();
-                                      setState(() => _searchResults = []);
-                                    },
-                                  )
-                                : null,
-                            filled: true,
-                            fillColor: Colors.transparent,
-                            border: OutlineInputBorder(
-                              borderRadius: BorderRadius.circular(28),
-                              borderSide: BorderSide.none,
+                            Expanded(
+                              child: TextField(
+                                controller: _searchController,
+                                decoration: InputDecoration(
+                                  hintText: 'Rechercher une destination...',
+                                  hintStyle: TextStyle(
+                                    color: Colors.grey.shade500,
+                                  ),
+                                  prefixIcon: Icon(
+                                    Icons.search_rounded,
+                                    color: Colors.grey.shade600,
+                                  ),
+                                  suffixIcon: _isSearching
+                                      ? const Padding(
+                                          padding: EdgeInsets.all(12),
+                                          child: SizedBox(
+                                            width: 20,
+                                            height: 20,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                            ),
+                                          ),
+                                        )
+                                      : _searchController.text.isNotEmpty
+                                      ? IconButton(
+                                          icon: Icon(
+                                            Icons.clear_rounded,
+                                            color: Colors.grey.shade600,
+                                          ),
+                                          onPressed: () {
+                                            _searchController.clear();
+                                            setState(() => _searchResults = []);
+                                          },
+                                        )
+                                      : null,
+                                  filled: true,
+                                  fillColor: Colors.transparent,
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(28),
+                                    borderSide: BorderSide.none,
+                                  ),
+                                  contentPadding: const EdgeInsets.symmetric(
+                                    vertical: 0,
+                                  ),
+                                ),
+                                onChanged: (value) {
+                                  if (value.isEmpty) {
+                                    setState(() => _searchResults = []);
+                                  } else if (value.length > 2) {
+                                    _search(value);
+                                  }
+                                },
+                              ),
                             ),
-                            contentPadding: const EdgeInsets.symmetric(
-                              vertical: 0,
-                            ),
-                          ),
-                          onSubmitted: _search,
+                          ],
                         ),
                       ),
                     ),
@@ -582,7 +723,37 @@ class _MapScreenState extends State<MapScreen> {
               bottom: bottomPadding + 8,
               right: 16,
               child: GestureDetector(
-                onTap: () => _mapController.move(_currentPosition, 15.0),
+                onTap: _focusOnLocation,
+                child: Container(
+                  width: 46,
+                  height: 46,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    shape: BoxShape.circle,
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.15),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: const Icon(
+                    Icons.my_location_rounded,
+                    color: Color(0xFF1A73E8),
+                    size: 22,
+                  ),
+                ),
+              ),
+            ),
+
+          // Bouton recentrer pendant la navigation
+          if (_routeValidated && _routeAlternatives.isNotEmpty && !_isFollowing)
+            Positioned(
+              bottom: 110,
+              right: 16,
+              child: GestureDetector(
+                onTap: _focusOnLocation,
                 child: Container(
                   width: 46,
                   height: 46,
@@ -646,6 +817,63 @@ class _MapScreenState extends State<MapScreen> {
             ),
           if (_routeValidated && _routeAlternatives.isNotEmpty)
             _buildNavigationBanner(),
+          Positioned(
+            bottom: bottomPadding + 16,
+            left: 16,
+            child: _buildSpeedometer(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSpeedometer() {
+    final speed = _speedKmh.round();
+    final Color speedColor;
+    if (speed < 50) {
+      speedColor = const Color(0xFF1A73E8);
+    } else if (speed < 90) {
+      speedColor = const Color(0xFFF9A825);
+    } else {
+      speedColor = const Color(0xFFD32F2F);
+    }
+
+    return Container(
+      width: 72,
+      height: 72,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        shape: BoxShape.circle,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.18),
+            blurRadius: 14,
+            offset: const Offset(0, 4),
+          ),
+        ],
+        border: Border.all(color: speedColor, width: 3),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Text(
+            '$speed',
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.bold,
+              color: speedColor,
+              height: 1.0,
+            ),
+          ),
+          Text(
+            'km/h',
+            style: TextStyle(
+              fontSize: 9,
+              color: Colors.grey.shade500,
+              fontWeight: FontWeight.w500,
+              letterSpacing: 0.5,
+            ),
+          ),
         ],
       ),
     );
@@ -868,10 +1096,7 @@ class _MapScreenState extends State<MapScreen> {
               child: IconButton(
                 padding: EdgeInsets.zero,
                 tooltip: 'Recentrer',
-                onPressed: () {
-                  setState(() => _isFollowing = true);
-                  _mapController.move(_currentPosition, 17.0);
-                },
+                onPressed: _focusOnLocation,
                 icon: const Icon(
                   Icons.my_location_rounded,
                   color: Color(0xFF1A73E8),
@@ -935,7 +1160,7 @@ class _MapScreenState extends State<MapScreen> {
     final isArrived = current.maneuverType == 'arrive';
     final bannerColor = isArrived
         ? const Color(0xFF0F9D58)
-        : const Color(0xFF1A73E8);
+        : const Color.fromARGB(255, 10, 10, 10);
 
     return Positioned(
       top: MediaQuery.of(context).padding.top + 8,

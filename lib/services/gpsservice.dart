@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -54,7 +55,7 @@ class GpsService {
     return Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
+        distanceFilter: 0,
       ),
     );
   }
@@ -66,16 +67,23 @@ class GpsService {
         'https://nominatim.openstreetmap.org/search'
         '?q=${Uri.encodeComponent(query)}&format=json&limit=5',
       );
-      final response = await http.get(
-        url,
-        headers: {'User-Agent': 'EcoDrivingApp/1.0 (contact@example.com)'},
-      );
+      final response = await http
+          .get(url, headers: {'User-Agent': 'EcoDrivingApp/1.0'})
+          .timeout(const Duration(seconds: 10));
+
       if (response.statusCode == 200) {
         final decoded = jsonDecode(response.body) as List<dynamic>;
         return decoded.cast<Map<String, dynamic>>();
+      } else {
+        throw Exception('Erreur serveur: ${response.statusCode}');
       }
-    } catch (_) {}
-    return [];
+    } on http.ClientException catch (e) {
+      throw Exception('Erreur réseau: ${e.message}');
+    } on TimeoutException {
+      throw Exception('La requête a dépassé le délai d\'attente');
+    } catch (e) {
+      throw Exception('Erreur de recherche: $e');
+    }
   }
 
   /// Calcule plusieurs itinéraires alternatifs via OSRM.
