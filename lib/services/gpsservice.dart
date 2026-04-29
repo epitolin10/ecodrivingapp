@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
+import 'package:flutter/foundation.dart';
 
 class RouteStep {
   final String maneuverType;
@@ -56,34 +58,74 @@ class GpsService {
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
         distanceFilter: 0,
+        timeLimit: Duration(seconds: 1),
       ),
     );
   }
 
-  /// Recherche un lieu via Nominatim (OpenStreetMap).
+  /// Recherche un lieu via Nominatim (OpenStreetMap) avec retry automatique.
   static Future<List<Map<String, dynamic>>> searchPlace(String query) async {
-    try {
-      final url = Uri.parse(
-        'https://nominatim.openstreetmap.org/search'
-        '?q=${Uri.encodeComponent(query)}&format=json&limit=5',
-      );
-      final response = await http
-          .get(url, headers: {'User-Agent': 'EcoDrivingApp/1.0'})
-          .timeout(const Duration(seconds: 10));
+    const maxRetries = 3;
+    int attempt = 0;
 
-      if (response.statusCode == 200) {
-        final decoded = jsonDecode(response.body) as List<dynamic>;
-        return decoded.cast<Map<String, dynamic>>();
-      } else {
-        throw Exception('Erreur serveur: ${response.statusCode}');
+    while (attempt < maxRetries) {
+      try {
+        final url = Uri.parse(
+          'https://nominatim.openstreetmap.org/search'
+          '?q=${Uri.encodeComponent(query)}&format=json&limit=5&countrycodes=fr',
+        );
+
+        final response = await http
+            .get(
+              url,
+              headers: {
+                'User-Agent': 'EcoDrivingApp/1.0 (Flutter; Android/iOS)',
+                'Accept': 'application/json',
+                'Accept-Language': 'fr-FR,fr;q=0.9',
+              },
+            )
+            .timeout(const Duration(seconds: 8));
+
+        if (response.statusCode == 200) {
+          final decoded = jsonDecode(response.body) as List<dynamic>;
+          if (decoded.isEmpty) {
+            throw Exception('Aucun résultat trouvé pour "$query"');
+          }
+          return decoded.cast<Map<String, dynamic>>();
+        } else if (response.statusCode == 429) {
+          // Rate limited, attendre avant de réessayer
+          await Future.delayed(Duration(milliseconds: 500 * (attempt + 1)));
+          attempt++;
+          continue;
+        } else {
+          throw Exception('Erreur serveur: ${response.statusCode}');
+        }
+      } on SocketException catch (e) {
+        throw Exception('Erreur réseau: ${e.message}');
+      } on http.ClientException catch (e) {
+        if (attempt < maxRetries - 1) {
+          await Future.delayed(Duration(milliseconds: 500 * (attempt + 1)));
+          attempt++;
+          continue;
+        }
+        throw Exception('Erreur réseau: Impossible de se connecter au serveur');
+      } on TimeoutException {
+        if (attempt < maxRetries - 1) {
+          await Future.delayed(Duration(milliseconds: 500 * (attempt + 1)));
+          attempt++;
+          continue;
+        }
+        throw Exception(
+          'La requête a dépassé le délai d\'attente. Vérifiez votre connexion Internet.',
+        );
+      } catch (e) {
+        throw Exception(
+          'Erreur de recherche: ${e.toString().replaceFirst('Exception: ', '')}',
+        );
       }
-    } on http.ClientException catch (e) {
-      throw Exception('Erreur réseau: ${e.message}');
-    } on TimeoutException {
-      throw Exception('La requête a dépassé le délai d\'attente');
-    } catch (e) {
-      throw Exception('Erreur de recherche: $e');
     }
+
+    throw Exception('Impossible de se connecter après plusieurs tentatives');
   }
 
   /// Calcule plusieurs itinéraires alternatifs via OSRM.

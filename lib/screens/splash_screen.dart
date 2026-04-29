@@ -78,7 +78,7 @@ class _SplashScreenState extends State<SplashScreen> {
               const SizedBox(height: 16),
               // Sous-titre
               const Text(
-                'Conduire responsable',
+                'Assistant d\'éco conduite',
                 style: TextStyle(
                   fontSize: 16,
                   color: Colors.white70,

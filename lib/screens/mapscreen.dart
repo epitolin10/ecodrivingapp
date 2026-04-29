@@ -1,4 +1,7 @@
+import 'dart:async';
 import 'dart:ui';
+import '../models/trip_data.dart';
+import 'trip_summary_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -42,9 +45,17 @@ class _MapScreenState extends State<MapScreen> {
   // Drapeau pour autoriser le recentrage automatique
   bool _shouldAutoFollow = false;
 
+  // Drapeau pour autoriser la rotation automatique de la carte
+  bool _shouldAutoRotate = false;
+
   // Dernière position utilisée pour recentrer (évite les micro-mouvements)
   LatLng? _lastFollowedPosition;
   double _speedKmh = 0.0;
+  double _lastSpeedMs = 0.0;
+  double _lastAltitude = 0.0;
+  double _instantLph = 0.0;
+  DateTime? _lastGpsTime;
+  LatLng? _lastGpsPos;
 
   // Synthèse vocale
   final FlutterTts _tts = FlutterTts();
@@ -53,9 +64,24 @@ class _MapScreenState extends State<MapScreen> {
 
   // Prix du carburant en €/L (chargé depuis l'API nationale)
   double? _fuelPricePerLiter;
+  final TripRecorder _tripRecorder = TripRecorder();
+  double _tripDistanceKm = 0.0;
 
   // Hit testing polyline (tap sur le tracé de la carte)
   final LayerHitNotifier<int> _polylineHitNotifier = ValueNotifier(null);
+
+  // Debounce timer pour les recherches
+  Timer? _searchDebounceTimer;
+
+  // Dernière distance connue à l'étape actuelle (pour hystérésis du recalage)
+  double? _lastStepDistance;
+
+  // Distance affichée à l'étape actuelle (arrondie aux seuils)
+  double _displayedStepDistance = 0.0;
+
+  // Temps et distance restants (mis à jour en temps réel)
+  int _remainingDurationMin = 0;
+  double _remainingDistanceKm = 0.0;
 
   @override
   void initState() {
@@ -81,6 +107,7 @@ class _MapScreenState extends State<MapScreen> {
     _tts.stop();
     _searchController.dispose();
     _polylineHitNotifier.dispose();
+    _searchDebounceTimer?.cancel();
     super.dispose();
   }
 
@@ -104,11 +131,89 @@ class _MapScreenState extends State<MapScreen> {
       if (!mounted) return;
       final pos = LatLng(position.latitude, position.longitude);
       final bearing = position.heading;
-      final speedKmh = (position.speed * 3.6).clamp(0.0, 300.0);
+      final speedMs = position.speed.clamp(0.0, 83.0);
+      final speedKmh = (speedMs * 3.6).clamp(0.0, 300.0);
+      final now = DateTime.now();
+      final altitude = position.altitude;
+
+      double acceleration = 0.0;
+      double altitudeDelta = 0.0;
+      double distanceDelta = 1.0;
+
+      if (_lastGpsTime != null) {
+        final dt = now.difference(_lastGpsTime!).inMilliseconds / 1000.0;
+        if (dt > 0.05) {
+          acceleration = (speedMs - _lastSpeedMs) / dt;
+          altitudeDelta = position.altitude - _lastAltitude;
+          distanceDelta = speedMs * dt;
+        }
+      }
+
+      if (widget.vehicleProfile != null) {
+        _instantLph = widget.vehicleProfile!.estimateInstantConsumptionLph(
+          speedMs: speedMs,
+          accelerationMs2: acceleration,
+          altitudeDeltaM: altitudeDelta,
+          distanceDeltaM: distanceDelta,
+        );
+      }
+
       setState(() {
         _currentPosition = pos;
         _bearing = bearing;
         _speedKmh = speedKmh;
+
+        if (_lastGpsTime != null) {
+          final dt = now.difference(_lastGpsTime!).inMilliseconds / 1000.0;
+          if (dt > 0.05) {
+            // Évite la division par zéro
+            acceleration = (speedMs - _lastSpeedMs) / dt;
+            altitudeDelta = position.altitude - _lastAltitude;
+            distanceDelta = speedMs * dt;
+          }
+        }
+
+        double instantLph = 0.5;
+        if (widget.vehicleProfile != null) {
+          instantLph = widget.vehicleProfile!.estimateInstantConsumptionLph(
+            speedMs: speedMs,
+            accelerationMs2: acceleration,
+            altitudeDeltaM: altitudeDelta,
+            distanceDeltaM: distanceDelta,
+          );
+        }
+
+        if (_routeValidated && _lastGpsPos != null) {
+          final delta = Geolocator.distanceBetween(
+            _lastGpsPos!.latitude,
+            _lastGpsPos!.longitude,
+            pos.latitude,
+            pos.longitude,
+          );
+          if (delta < 200) {
+            _tripDistanceKm += delta / 1000.0;
+          }
+        }
+
+        if (_routeValidated) {
+          _tripRecorder.addPoint(
+            speedKmh: speedKmh,
+            instantLph: _instantLph,
+            altitude: altitude,
+            accelerationMs2: acceleration,
+          );
+        }
+        _lastSpeedMs = speedMs;
+        _lastAltitude = altitude;
+        _lastGpsTime = now;
+        _lastGpsPos = pos;
+
+        setState(() {
+          _instantLph = instantLph;
+          _lastSpeedMs = speedMs;
+          _lastAltitude = position.altitude;
+          _lastGpsTime = now;
+        });
         _markers = [
           ..._markers.where((m) => m.key != const ValueKey('current')),
           Marker(
@@ -127,9 +232,9 @@ class _MapScreenState extends State<MapScreen> {
                         height: 60,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: Colors.blue.withOpacity(0.15),
+                          color: Colors.blue.withValues(alpha: 0.15),
                           border: Border.all(
-                            color: Colors.blue.withOpacity(0.25),
+                            color: Colors.blue.withValues(alpha: 0.25),
                             width: 1,
                           ),
                         ),
@@ -166,7 +271,7 @@ class _MapScreenState extends State<MapScreen> {
       });
       // Recentre : uniquement si le suivi automatique est activé pendant la navigation
       // Seuil de 10 m pour éviter les micro-mouvements GPS
-      final double _movedDist = _lastFollowedPosition == null
+      final double movedDist = _lastFollowedPosition == null
           ? double.infinity
           : Geolocator.distanceBetween(
               _lastFollowedPosition!.latitude,
@@ -174,27 +279,44 @@ class _MapScreenState extends State<MapScreen> {
               pos.latitude,
               pos.longitude,
             );
-      if (_shouldAutoFollow && _movedDist >= 10.0) {
+      if (_shouldAutoFollow && movedDist >= 10.0) {
         if (_routeValidated && _isFollowing) {
           _mapController.move(pos, 17.0);
           _lastFollowedPosition = pos;
         }
       }
 
+      // Rotation automatique de la carte en fonction du cap GPS
+      if (_shouldAutoRotate && _isFollowing) {
+        final radians = bearing * 3.141592653589793 / 180.0;
+        _mapController.rotate(radians);
+      }
+
       // Avancement automatique des étapes de navigation + annonces vocales
       if (_routeValidated && _routeAlternatives.isNotEmpty) {
         final steps = _routeAlternatives[_selectedRouteIndex].steps;
 
-        // ── NOUVEAU : recalage sur l'étape la plus proche ──────────────
-        // Cherche parmi les étapes restantes celle dont le point
-        // est le plus proche de la position actuelle
-        if (steps.length > 2) {
-          int bestIdx = _navStepIndex;
-          double bestDist = double.infinity;
+        // ── RECALAGE AVEC HYSTÉRÉSIS : évite de changer d'étape à cause des imprécisions GPS ──
+        // Ne change d'étape que si on est au moins 50m plus proche
+        if (steps.length > 2 && _navStepIndex < steps.length) {
+          // Distance à l'étape actuelle
+          final currentStepDist = Geolocator.distanceBetween(
+            pos.latitude,
+            pos.longitude,
+            steps[_navStepIndex].location.latitude,
+            steps[_navStepIndex].location.longitude,
+          );
 
-          // On cherche dans une fenêtre : étape actuelle ± 5
-          final searchFrom = (_navStepIndex - 1).clamp(1, steps.length - 1);
-          final searchTo = (_navStepIndex + 5).clamp(1, steps.length - 1);
+          int bestIdx = _navStepIndex;
+          double bestDist = currentStepDist;
+
+          // On cherche dans une fenêtre : étape actuelle à +5
+          // (on ne cherche pas en arrière pour éviter de reculer)
+          final searchFrom = _navStepIndex;
+          final searchTo = (_navStepIndex + 5).clamp(
+            _navStepIndex,
+            steps.length - 1,
+          );
 
           for (int i = searchFrom; i <= searchTo; i++) {
             final d = Geolocator.distanceBetween(
@@ -209,18 +331,19 @@ class _MapScreenState extends State<MapScreen> {
             }
           }
 
-          // Si on a trouvé une étape plus pertinente (et qu'on ne recule pas
-          // de plus d'une étape pour éviter les faux positifs)
-          if (bestIdx != _navStepIndex && bestIdx >= _navStepIndex - 1) {
+          // Ne change d'étape que si on est au moins 50m plus proche
+          // (hystérésis : évite les oscillations GPS sur lignes droites)
+          if (bestIdx > _navStepIndex && (currentStepDist - bestDist) > 50.0) {
             setState(() {
               _navStepIndex = bestIdx;
               _announced300 = false;
               _announced100 = false;
+              _lastStepDistance = bestDist;
             });
             _speak(_stepInstructionShort(steps[bestIdx]));
           }
         }
-        // ── FIN recalage ───────────────────────────────────────────────
+        // ── FIN RECALAGE ───────────────────────────────────────────────
 
         if (_navStepIndex < steps.length - 1) {
           final target = steps[_navStepIndex].location;
@@ -230,6 +353,14 @@ class _MapScreenState extends State<MapScreen> {
             target.latitude,
             target.longitude,
           );
+
+          // Arrondir la distance pour l'affichage et mettre à jour si elle a changé
+          final roundedDist = _roundDisplayDistance(dist);
+          if (roundedDist != _displayedStepDistance) {
+            setState(() {
+              _displayedStepDistance = roundedDist;
+            });
+          }
 
           // Annonce à 300 m
           if (dist <= 300 && !_announced300) {
@@ -247,17 +378,48 @@ class _MapScreenState extends State<MapScreen> {
           // Passage à l'étape suivante (seuil abaissé à 20 m pour plus de réactivité)
           if (dist < 20 && mounted) {
             final nextIdx = _navStepIndex + 1;
-            setState(() {
-              _navStepIndex = nextIdx;
-              _announced300 = false;
-              _announced100 = false;
-            });
-            if (nextIdx < steps.length) {
-              _speak(_stepInstructionShort(steps[nextIdx]));
+            if (nextIdx >= steps.length) {
+              _speak('Vous êtes arrivé à destination.');
+              Future.delayed(const Duration(seconds: 2), () {
+                if (mounted) _clearRoute(arrived: true);
+              });
+            } else {
+              setState(() {
+                _navStepIndex = nextIdx;
+                _announced300 = false;
+                _announced100 = false;
+              });
+              if (steps[nextIdx].maneuverType == 'arrive') {
+                _speak('Vous êtes arrivé à destination.');
+                Future.delayed(const Duration(seconds: 2), () {
+                  if (mounted) _clearRoute(arrived: true);
+                });
+              } else {
+                _speak(_stepInstructionShort(steps[nextIdx]));
+              }
             }
           }
         }
       }
+
+      // Mettre à jour le temps et la distance restants en continu
+      _calculateRemaining(pos);
+    });
+  }
+
+  /// Lance une recherche avec debounce (attend 600ms après la fin de la frappe).
+  /// Cela évite de faire trop de requêtes à l'API Nominatim.
+  void _debouncedSearch(String query) {
+    _searchDebounceTimer?.cancel();
+
+    if (query.trim().isEmpty) {
+      setState(() => _searchResults = []);
+      return;
+    }
+
+    // Attendre 600ms avant de lancer la requête
+    _searchDebounceTimer = Timer(const Duration(milliseconds: 600), () {
+      _search(query);
     });
   }
 
@@ -316,6 +478,7 @@ class _MapScreenState extends State<MapScreen> {
       _routeAlternatives = [];
       _selectedRouteIndex = 0;
       _routeValidated = false;
+      _displayedStepDistance = 0.0;
     });
 
     final alternatives = await GpsService.getRoutes(_currentPosition, dest);
@@ -344,20 +507,63 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  void _clearRoute() {
+  void _clearRoute({bool arrived = false}) {
     _tts.stop();
+    if (arrived && _tripRecorder.isRecording) {
+      final route = _routeAlternatives[_selectedRouteIndex];
+      final summary = _tripRecorder.finish(
+        realDistanceKm: _tripDistanceKm,
+        estimatedDurationMin: route.durationMin,
+        estimatedDistanceKm: route.distanceKm,
+        fuelPricePerLiter: _fuelPricePerLiter,
+        fuelType: widget.vehicleProfile?.fuelType.name ?? 'essence',
+      );
+
+      if (summary != null && mounted) {
+        Navigator.of(context).push(
+          PageRouteBuilder(
+            pageBuilder: (_, animation, __) => TripSummaryScreen(
+              summary: summary,
+              onClose: () => Navigator.of(context).pop(),
+            ),
+            transitionsBuilder: (_, animation, __, child) =>
+                FadeTransition(opacity: animation, child: child),
+            transitionDuration: const Duration(milliseconds: 400),
+          ),
+        );
+      } else {
+        _tripRecorder.finish(
+          realDistanceKm: _tripDistanceKm,
+          estimatedDurationMin: 0,
+          estimatedDistanceKm: 0,
+        );
+      }
+    }
+    _resetRouteState();
+  }
+
+  void _resetRouteState() {
     setState(() {
       _routeAlternatives = [];
       _selectedRouteIndex = 0;
       _routeValidated = false;
       _isFollowing = false;
       _shouldAutoFollow = false;
+      _shouldAutoRotate = false;
       _navStepIndex = 1;
       _announced300 = false;
       _announced100 = false;
-      // Recréer le marqueur GPS normal
+      _displayedStepDistance = 0.0;
+      _remainingDurationMin = 0;
+      _remainingDistanceKm = 0.0;
+      _tripDistanceKm = 0.0;
+      _lastGpsPos = null;
       _markers = [
-        ..._markers.where((m) => m.key != const ValueKey('search')),
+        ..._markers.where(
+          (m) =>
+              m.key != const ValueKey('search') &&
+              m.key != const ValueKey('current'),
+        ),
         Marker(
           key: const ValueKey('current'),
           point: _currentPosition,
@@ -366,20 +572,18 @@ class _MapScreenState extends State<MapScreen> {
           child: Stack(
             alignment: Alignment.center,
             children: [
-              // Halo de précision (cercle externe semi-transparent)
               Container(
                 width: 60,
                 height: 60,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: Colors.blue.withOpacity(0.15),
+                  color: Colors.blue.withValues(alpha: 0.15),
                   border: Border.all(
-                    color: Colors.blue.withOpacity(0.25),
+                    color: Colors.blue.withValues(alpha: 0.25),
                     width: 1,
                   ),
                 ),
               ),
-              // Anneau blanc avec ombre
               Container(
                 width: 22,
                 height: 22,
@@ -395,7 +599,6 @@ class _MapScreenState extends State<MapScreen> {
                   ],
                 ),
               ),
-              // Point bleu central
               Container(
                 width: 14,
                 height: 14,
@@ -414,13 +617,25 @@ class _MapScreenState extends State<MapScreen> {
 
   void _validateRoute() {
     final steps = _routeAlternatives[_selectedRouteIndex].steps;
+
+    _tripRecorder.start();
+    _tripDistanceKm = 0.0;
+    _lastGpsTime ??= DateTime.now();
+
     setState(() {
       _routeValidated = true;
       _isFollowing = true;
       _shouldAutoFollow = true;
+      _shouldAutoRotate = true;
       _navStepIndex = steps.length > 1 ? 1 : 0;
       _announced300 = false;
       _announced100 = false;
+      _lastStepDistance = null; // Réinitialiser l'hystérésis
+      _displayedStepDistance = 0.0; // Réinitialiser la distance affichée
+      // Initialiser le temps et la distance restants
+      final route = _routeAlternatives[_selectedRouteIndex];
+      _remainingDurationMin = route.durationMin;
+      _remainingDistanceKm = route.distanceKm;
       // Rebuild le marqueur en flèche immédiatement
       _markers = [
         ..._markers.where((m) => m.key != const ValueKey('current')),
@@ -445,6 +660,7 @@ class _MapScreenState extends State<MapScreen> {
     setState(() {
       _isFollowing = true;
       _shouldAutoFollow = true;
+      _shouldAutoRotate = _routeValidated;
     });
     _mapController.move(_currentPosition, _routeValidated ? 17.0 : 15.0);
     _lastFollowedPosition = _currentPosition;
@@ -478,11 +694,65 @@ class _MapScreenState extends State<MapScreen> {
     return '${km.toStringAsFixed(1)} km';
   }
 
+  /// Arrondit la distance pour l'affichage :
+  /// - Si > 100m : arrondit à 50m (550m -> 550m, 540m -> 550m)
+  /// - Si <= 100m : arrondit à 10m (95m -> 100m, 85m -> 90m)
+  double _roundDisplayDistance(double distanceM) {
+    if (distanceM > 100) {
+      // Arrondir à 50m (50, 100, 150, 200, etc.)
+      return ((distanceM + 25) ~/ 50) * 50.0;
+    } else {
+      // Arrondir à 10m (10, 20, 30, etc.)
+      return ((distanceM + 5) ~/ 10) * 10.0;
+    }
+  }
+
   String _formatDuration(int minutes) {
     if (minutes < 60) return '$minutes min';
     final h = minutes ~/ 60;
     final m = minutes % 60;
     return m == 0 ? '${h}h' : '${h}h ${m}min';
+  }
+
+  /// Calcule le temps et la distance restants à partir de la position actuelle
+  /// jusqu'à la destination finale.
+  void _calculateRemaining(LatLng currentPos) {
+    if (!_routeValidated || _routeAlternatives.isEmpty) {
+      return;
+    }
+
+    final steps = _routeAlternatives[_selectedRouteIndex].steps;
+    if (steps.isEmpty || _navStepIndex >= steps.length) {
+      _remainingDurationMin = 0;
+      _remainingDistanceKm = 0.0;
+      return;
+    }
+
+    // Distance de la position actuelle à la fin de l'étape actuelle
+    double remainingDistanceM = Geolocator.distanceBetween(
+      currentPos.latitude,
+      currentPos.longitude,
+      steps[_navStepIndex].location.latitude,
+      steps[_navStepIndex].location.longitude,
+    );
+
+    // Durée restante pour l'étape actuelle (proportionnelle à la distance)
+    double remainingDurationSec = 0;
+    if (steps[_navStepIndex].distanceM > 0) {
+      final ratio = remainingDistanceM / steps[_navStepIndex].distanceM;
+      remainingDurationSec = steps[_navStepIndex].durationSec * ratio;
+    }
+
+    // Ajouter le temps et la distance des étapes suivantes
+    for (int i = _navStepIndex + 1; i < steps.length; i++) {
+      remainingDistanceM += steps[i].distanceM;
+      remainingDurationSec += steps[i].durationSec;
+    }
+
+    setState(() {
+      _remainingDistanceKm = remainingDistanceM / 1000.0;
+      _remainingDurationMin = (remainingDurationSec / 60.0).round();
+    });
   }
 
   List<Polyline<int>> get _buildPolylines {
@@ -539,6 +809,7 @@ class _MapScreenState extends State<MapScreen> {
                   setState(() {
                     _isFollowing = false;
                     _shouldAutoFollow = false;
+                    _shouldAutoRotate = false;
                   });
                 }
               },
@@ -580,11 +851,11 @@ class _MapScreenState extends State<MapScreen> {
                       filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
                       child: Container(
                         decoration: BoxDecoration(
-                          color: Colors.white.withOpacity(0.93),
+                          color: Colors.white.withValues(alpha: 0.93),
                           borderRadius: BorderRadius.circular(28),
                           boxShadow: [
                             BoxShadow(
-                              color: Colors.black.withOpacity(0.12),
+                              color: Colors.black.withValues(alpha: 0.12),
                               blurRadius: 20,
                               offset: const Offset(0, 4),
                             ),
@@ -651,7 +922,7 @@ class _MapScreenState extends State<MapScreen> {
                                   if (value.isEmpty) {
                                     setState(() => _searchResults = []);
                                   } else if (value.length > 2) {
-                                    _search(value);
+                                    _debouncedSearch(value);
                                   }
                                 },
                               ),
@@ -669,7 +940,7 @@ class _MapScreenState extends State<MapScreen> {
                         borderRadius: BorderRadius.circular(20),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.black.withOpacity(0.1),
+                            color: Colors.black.withValues(alpha: 0.1),
                             blurRadius: 20,
                             offset: const Offset(0, 4),
                           ),
@@ -692,7 +963,7 @@ class _MapScreenState extends State<MapScreen> {
                                 decoration: BoxDecoration(
                                   color: const Color(
                                     0xFF1A73E8,
-                                  ).withOpacity(0.1),
+                                  ).withValues(alpha: 0.1),
                                   shape: BoxShape.circle,
                                 ),
                                 child: const Icon(
@@ -732,37 +1003,7 @@ class _MapScreenState extends State<MapScreen> {
                     shape: BoxShape.circle,
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.black.withOpacity(0.15),
-                        blurRadius: 12,
-                        offset: const Offset(0, 4),
-                      ),
-                    ],
-                  ),
-                  child: const Icon(
-                    Icons.my_location_rounded,
-                    color: Color(0xFF1A73E8),
-                    size: 22,
-                  ),
-                ),
-              ),
-            ),
-
-          // Bouton recentrer pendant la navigation
-          if (_routeValidated && _routeAlternatives.isNotEmpty && !_isFollowing)
-            Positioned(
-              bottom: 110,
-              right: 16,
-              child: GestureDetector(
-                onTap: _focusOnLocation,
-                child: Container(
-                  width: 46,
-                  height: 46,
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.15),
+                        color: Colors.black.withValues(alpha: 0.15),
                         blurRadius: 12,
                         offset: const Offset(0, 4),
                       ),
@@ -838,44 +1079,102 @@ class _MapScreenState extends State<MapScreen> {
       speedColor = const Color(0xFFD32F2F);
     }
 
-    return Container(
-      width: 72,
-      height: 72,
-      decoration: BoxDecoration(
-        color: Colors.white,
-        shape: BoxShape.circle,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.18),
-            blurRadius: 14,
-            offset: const Offset(0, 4),
-          ),
-        ],
-        border: Border.all(color: speedColor, width: 3),
-      ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Text(
-            '$speed',
-            style: TextStyle(
-              fontSize: 22,
-              fontWeight: FontWeight.bold,
-              color: speedColor,
-              height: 1.0,
+    final consumptionColor = _instantLph > 12 ? Colors.red : Colors.green[700]!;
+
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        // Fond dégradé circulaire
+        Container(
+          width: 100,
+          height: 100,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: [Colors.white, Colors.grey.shade50],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: speedColor.withValues(alpha: 0.3),
+                blurRadius: 20,
+                spreadRadius: 2,
+                offset: const Offset(0, 6),
+              ),
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.08),
+                blurRadius: 16,
+                offset: const Offset(0, 4),
+              ),
+            ],
+            border: Border.all(
+              color: speedColor.withValues(alpha: 0.6),
+              width: 2,
             ),
           ),
-          Text(
-            'km/h',
-            style: TextStyle(
-              fontSize: 9,
-              color: Colors.grey.shade500,
-              fontWeight: FontWeight.w500,
-              letterSpacing: 0.5,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              // Valeur de vitesse
+              Text(
+                '$speed',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.w900,
+                  color: speedColor,
+                  height: 1.0,
+                  letterSpacing: -0.5,
+                ),
+              ),
+              // Unité km/h
+              Text(
+                'km/h',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Colors.grey.shade600,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.3,
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Badge de consommation (haut droit)
+        if (widget.vehicleProfile != null)
+          Positioned(
+            top: -4,
+            right: -4,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(10),
+                boxShadow: [
+                  BoxShadow(
+                    color: consumptionColor.withValues(alpha: 0.25),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.06),
+                    blurRadius: 6,
+                  ),
+                ],
+                border: Border.all(color: Colors.transparent, width: 0),
+              ),
+              child: Text(
+                '${_instantLph.toStringAsFixed(1)} L/h',
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  color: consumptionColor,
+                  letterSpacing: 0.1,
+                ),
+              ),
             ),
           ),
-        ],
-      ),
+      ],
     );
   }
 
@@ -1042,7 +1341,7 @@ class _MapScreenState extends State<MapScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                _formatDuration(route.durationMin),
+                _formatDuration(_remainingDurationMin),
                 style: const TextStyle(
                   fontSize: 24,
                   fontWeight: FontWeight.bold,
@@ -1050,7 +1349,7 @@ class _MapScreenState extends State<MapScreen> {
                 ),
               ),
               Text(
-                _formatDistance(route.distanceKm),
+                _formatDistance(_remainingDistanceKm),
                 style: TextStyle(fontSize: 13, color: Colors.grey[600]),
               ),
               if (widget.vehicleProfile != null)
@@ -1090,7 +1389,7 @@ class _MapScreenState extends State<MapScreen> {
               width: 40,
               height: 40,
               decoration: BoxDecoration(
-                color: const Color(0xFF1A73E8).withOpacity(0.1),
+                color: const Color(0xFF1A73E8).withValues(alpha: 0.1),
                 shape: BoxShape.circle,
               ),
               child: IconButton(
@@ -1150,13 +1449,6 @@ class _MapScreenState extends State<MapScreen> {
     final hasNext = idx + 1 < steps.length;
     final next = hasNext ? steps[idx + 1] : null;
 
-    final distM = Geolocator.distanceBetween(
-      _currentPosition.latitude,
-      _currentPosition.longitude,
-      current.location.latitude,
-      current.location.longitude,
-    );
-
     final isArrived = current.maneuverType == 'arrive';
     final bannerColor = isArrived
         ? const Color(0xFF0F9D58)
@@ -1181,7 +1473,7 @@ class _MapScreenState extends State<MapScreen> {
                     width: 56,
                     height: 56,
                     decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.2),
+                      color: Colors.white.withValues(alpha: 0.2),
                       borderRadius: BorderRadius.circular(12),
                     ),
                     child: Icon(
@@ -1197,7 +1489,7 @@ class _MapScreenState extends State<MapScreen> {
                       children: [
                         if (!isArrived)
                           Text(
-                            _formatDistance(distM / 1000),
+                            _formatDistance(_displayedStepDistance / 1000),
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 26,
@@ -1344,7 +1636,7 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  String _ordinalFr(int n) => n == 1 ? '1ère' : '${n}ème';
+  String _ordinalFr(int n) => n == 1 ? '1ère' : '$nème';
 
   Widget _buildBottomSheet({required Widget child}) {
     return Container(
