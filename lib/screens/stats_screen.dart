@@ -67,7 +67,7 @@ class _StatsScreenState extends State<StatsScreen> {
       'totalCost': totalCost,
       'avgScore': avgScore.round(),
       'totalTrips': totalTrips,
-      'avgKmPerTrip': totalTrips > 0 ? totalKm / totalTrips : 0,
+      'avgKmPerTrip': totalTrips > 0 ? totalKm / totalTrips : 0.0,
     };
   }
 
@@ -141,6 +141,10 @@ class _StatsScreenState extends State<StatsScreen> {
   // ── Résumé annuel ─────────────────────────────────────────────────
 
   Widget _buildYearSummary(Map<String, dynamic> stats) {
+    final totalKm = (stats['totalKm'] as num).toDouble();
+    final totalCo2 = (stats['totalCo2'] as num).toDouble();
+    final avgKmPerTrip = (stats['avgKmPerTrip'] as num).toDouble();
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -172,7 +176,7 @@ class _StatsScreenState extends State<StatsScreen> {
             children: [
               _StatTile(
                 label: 'Total km',
-                value: '${(stats['totalKm'] as double).toStringAsFixed(0)} km',
+                value: '${totalKm.toStringAsFixed(0)} km',
                 icon: Icons.route_rounded,
                 color: const Color(0xFF1A73E8),
               ),
@@ -184,16 +188,15 @@ class _StatsScreenState extends State<StatsScreen> {
               ),
               _StatTile(
                 label: 'CO₂ annuel',
-                value: (stats['totalCo2'] as double) >= 1000
-                    ? '${((stats['totalCo2'] as double) / 1000).toStringAsFixed(1)} kg'
-                    : '${(stats['totalCo2'] as double).round()} g',
+                value: totalCo2 >= 1000
+                    ? '${(totalCo2 / 1000).toStringAsFixed(1)} kg'
+                    : '${totalCo2.round()} g',
                 icon: Icons.cloud_outlined,
                 color: const Color(0xFF78909C),
               ),
               _StatTile(
                 label: 'Moy. km/trajet',
-                value:
-                    '${(stats['avgKmPerTrip'] as double).toStringAsFixed(1)} km',
+                value: '${avgKmPerTrip.toStringAsFixed(1)} km',
                 icon: Icons.trending_up_rounded,
                 color: const Color(0xFFFF6F00),
               ),

@@ -4,7 +4,6 @@ import 'dart:io';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
-import 'package:flutter/foundation.dart';
 
 class RouteStep {
   final String maneuverType;
@@ -44,10 +43,19 @@ class GpsService {
   /// Vérifie et demande les permissions de localisation.
   /// Retourne true si la permission est accordée.
   static Future<bool> checkAndRequestPermission() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      return false;
+    }
+
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
     }
+    if (permission == LocationPermission.deniedForever) {
+      return false;
+    }
+
     return permission == LocationPermission.whileInUse ||
         permission == LocationPermission.always;
   }
@@ -55,12 +63,32 @@ class GpsService {
   /// Retourne un stream de positions GPS en continu.
   static Stream<Position> getPositionStream() {
     return Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 0,
-        timeLimit: Duration(seconds: 1),
-      ),
+      locationSettings: _navigationLocationSettings(),
     );
+  }
+
+  static LocationSettings _navigationLocationSettings() {
+    const accuracy = LocationAccuracy.bestForNavigation;
+
+    if (Platform.isAndroid) {
+      return AndroidSettings(
+        accuracy: accuracy,
+        distanceFilter: 0,
+        intervalDuration: const Duration(seconds: 1),
+      );
+    }
+
+    if (Platform.isIOS || Platform.isMacOS) {
+      return AppleSettings(
+        accuracy: accuracy,
+        distanceFilter: 0,
+        activityType: ActivityType.automotiveNavigation,
+        pauseLocationUpdatesAutomatically: false,
+        allowBackgroundLocationUpdates: false,
+      );
+    }
+
+    return const LocationSettings(accuracy: accuracy, distanceFilter: 0);
   }
 
   /// Recherche un lieu via Nominatim (OpenStreetMap) avec retry automatique.
@@ -102,7 +130,7 @@ class GpsService {
         }
       } on SocketException catch (e) {
         throw Exception('Erreur réseau: ${e.message}');
-      } on http.ClientException catch (e) {
+      } on http.ClientException {
         if (attempt < maxRetries - 1) {
           await Future.delayed(Duration(milliseconds: 500 * (attempt + 1)));
           attempt++;

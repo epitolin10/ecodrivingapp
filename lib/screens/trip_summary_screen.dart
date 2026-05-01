@@ -23,7 +23,7 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
   late final AnimationController _scoreCtrl;
   late final Animation<double> _scoreAnim;
 
-  // Graphe : onglet sélectionné (0 = vitesse, 1 = consommation)
+  // Graphe : onglet sélectionné (0 = vitesse, 1 = accélération, 2 = consommation)
   int _chartTab = 0;
 
   @override
@@ -383,7 +383,9 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
               children: [
                 _chartTabBtn(0, Icons.speed_rounded, 'Vitesse'),
                 const SizedBox(width: 8),
-                _chartTabBtn(1, Icons.local_gas_station_rounded, 'Conso.'),
+                _chartTabBtn(1, Icons.trending_up_rounded, 'Accél.'),
+                const SizedBox(width: 8),
+                _chartTabBtn(2, Icons.local_gas_station_rounded, 'Conso.'),
               ],
             ),
             const SizedBox(height: 16),
@@ -396,11 +398,17 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
                 _legendDot(
                   _chartTab == 0
                       ? const Color(0xFF1A73E8)
+                      : _chartTab == 1
+                      ? const Color(0xFFE91E63)
                       : const Color(0xFFFF6F00),
                 ),
                 const SizedBox(width: 6),
                 Text(
-                  _chartTab == 0 ? 'Vitesse (km/h)' : 'Consommation (L/h)',
+                  _chartTab == 0
+                      ? 'Vitesse (km/h) · pics colorés = accélérations'
+                      : _chartTab == 1
+                      ? 'Accélération (m/s²)'
+                      : 'Consommation (L/h)',
                   style: TextStyle(
                     color: Colors.white.withOpacity(0.5),
                     fontSize: 11,
@@ -480,23 +488,39 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
     final sampled = _downsample(points, 80);
     final values = _chartTab == 0
         ? sampled.map((p) => p.speedKmh).toList()
+        : _chartTab == 1
+        ? sampled.map((p) => p.accelerationMs2).toList()
         : sampled.map((p) => p.instantLph).toList();
 
-    final maxVal = values.reduce(math.max);
-    final minVal = values.reduce(math.min);
-    final range = (maxVal - minVal).clamp(1.0, double.infinity);
+    final rawMax = values.reduce(math.max);
+    final rawMin = values.reduce(math.min);
+    final maxAbs = math
+        .max(rawMax.abs(), rawMin.abs())
+        .clamp(1.0, double.infinity);
+    final minVal = _chartTab == 1 ? -maxAbs : rawMin;
+    final maxVal = _chartTab == 1 ? maxAbs : rawMax;
 
     final lineColor = _chartTab == 0
         ? const Color(0xFF1A73E8)
+        : _chartTab == 1
+        ? const Color(0xFFE91E63)
         : const Color(0xFFFF6F00);
 
-    return CustomPaint(
-      painter: _LinechartPainter(
-        values: values,
-        minVal: minVal,
-        maxVal: maxVal,
-        lineColor: lineColor,
-      ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return CustomPaint(
+          size: Size(constraints.maxWidth, constraints.maxHeight),
+          painter: _LinechartPainter(
+            values: values,
+            highlightValues: sampled.map((p) => p.accelerationMs2).toList(),
+            minVal: minVal,
+            maxVal: maxVal,
+            lineColor: lineColor,
+            baselineAtZero: _chartTab == 1,
+            showAccelerationHighlights: _chartTab == 0,
+          ),
+        );
+      },
     );
   }
 
@@ -1113,34 +1137,69 @@ class _ScoreGaugePainter extends CustomPainter {
 
 class _LinechartPainter extends CustomPainter {
   final List<double> values;
+  final List<double> highlightValues;
   final double minVal;
   final double maxVal;
   final Color lineColor;
+  final bool baselineAtZero;
+  final bool showAccelerationHighlights;
 
   _LinechartPainter({
     required this.values,
+    required this.highlightValues,
     required this.minVal,
     required this.maxVal,
     required this.lineColor,
+    required this.baselineAtZero,
+    required this.showAccelerationHighlights,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     if (values.length < 2) return;
 
-    final range = (maxVal - minVal).clamp(1.0, double.infinity);
+    final visualPadding = ((maxVal - minVal) * 0.12).clamp(0.4, 12.0);
+    final chartMin = minVal - visualPadding;
+    final chartMax = maxVal + visualPadding;
+    final range = (chartMax - chartMin).clamp(1.0, double.infinity);
     final w = size.width;
     final h = size.height;
-    final padTop = 12.0;
+    final padLeft = 28.0;
+    final padRight = 6.0;
+    final padTop = 10.0;
     final padBottom = 20.0;
+    final chartW = w - padLeft - padRight;
     final chartH = h - padTop - padBottom;
+
+    if (chartW <= 0 || chartH <= 0) return;
+
+    double yFor(double value) {
+      return padTop + chartH * (1 - (value - chartMin) / range);
+    }
 
     // Points
     final pts = <Offset>[];
     for (int i = 0; i < values.length; i++) {
-      final x = (i / (values.length - 1)) * w;
-      final y = padTop + chartH * (1 - (values[i] - minVal) / range);
+      final x = padLeft + (i / (values.length - 1)) * chartW;
+      final y = yFor(values[i]);
       pts.add(Offset(x, y));
+    }
+
+    // Zones d'accélération importante sur l'axe du temps.
+    if (showAccelerationHighlights && highlightValues.length == values.length) {
+      final highlightPaint = Paint()
+        ..color = const Color(0xFFE91E63).withOpacity(0.16)
+        ..strokeWidth = math.max(3, chartW / values.length)
+        ..strokeCap = StrokeCap.round;
+      for (int i = 0; i < highlightValues.length; i++) {
+        if (highlightValues[i] < 1.2) continue;
+        final x = padLeft + (i / (highlightValues.length - 1)) * chartW;
+        canvas.drawLine(
+          Offset(x, padTop),
+          Offset(x, h - padBottom),
+          highlightPaint,
+        );
+      }
     }
 
     // Zone de remplissage (gradient)
@@ -1157,8 +1216,19 @@ class _LinechartPainter extends CustomPainter {
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [lineColor.withOpacity(0.25), lineColor.withOpacity(0.0)],
-        ).createShader(Rect.fromLTWH(0, padTop, w, chartH)),
+        ).createShader(Rect.fromLTWH(padLeft, padTop, chartW, chartH)),
     );
+
+    if (baselineAtZero) {
+      final zeroY = yFor(0);
+      canvas.drawLine(
+        Offset(padLeft, zeroY),
+        Offset(w - padRight, zeroY),
+        Paint()
+          ..color = Colors.white.withOpacity(0.16)
+          ..strokeWidth = 1,
+      );
+    }
 
     // Ligne
     final linePath = Path()..moveTo(pts.first.dx, pts.first.dy);
@@ -1185,13 +1255,15 @@ class _LinechartPainter extends CustomPainter {
       ..strokeWidth = 1;
     for (int i = 0; i <= 3; i++) {
       final y = padTop + (chartH / 3) * i;
-      canvas.drawLine(Offset(0, y), Offset(w, y), gridPaint);
+      canvas.drawLine(Offset(padLeft, y), Offset(w - padRight, y), gridPaint);
 
       // Labels axe Y
-      final val = maxVal - (range / 3) * i;
+      final val = chartMax - (range / 3) * i;
       final tpY = TextPainter(
         text: TextSpan(
-          text: val.round().toString(),
+          text: val.abs() < 10
+              ? val.toStringAsFixed(1)
+              : val.round().toString(),
           style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 9),
         ),
         textDirection: TextDirection.ltr,
@@ -1202,5 +1274,9 @@ class _LinechartPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_LinechartPainter old) =>
-      old.values != values || old.lineColor != old.lineColor;
+      old.values != values ||
+      old.highlightValues != highlightValues ||
+      old.lineColor != lineColor ||
+      old.baselineAtZero != baselineAtZero ||
+      old.showAccelerationHighlights != showAccelerationHighlights;
 }

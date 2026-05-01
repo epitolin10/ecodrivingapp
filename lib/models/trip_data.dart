@@ -184,17 +184,19 @@ class TripRecorder {
 
     // Score : pénalités sur 100
     // Chaque événement retire des points, plafonnés
-    final penaltyAcc = (hardAcc * 2).clamp(0, 30);
-    final penaltyBrk = (hardBrk * 2).clamp(0, 30);
-    final penaltySpeeding = (speeding ~/ 3).clamp(0, 20);
-    // Bonus si conso réelle < 8 L/100
-    final bonusEco = realL100 < 8 ? 10 : (realL100 < 12 ? 5 : 0);
+    final penaltyAcc = (hardAcc * 12).clamp(0, 40).toInt();
+    final penaltyBrk = (hardBrk * 14).clamp(0, 45).toInt();
+    final penaltySpeeding = (speeding * 2).clamp(0, 30).toInt();
+    final penaltyConsumption = realL100 <= 8
+        ? 0
+        : realL100 <= 12
+        ? 5
+        : 12;
 
     final ecoScore =
-        (100 - penaltyAcc - penaltyBrk - penaltySpeeding + bonusEco).clamp(
-          0,
-          100,
-        );
+        (100 - penaltyAcc - penaltyBrk - penaltySpeeding - penaltyConsumption)
+            .clamp(0, 100)
+            .toInt();
 
     _startTime = null;
 

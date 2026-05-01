@@ -1,12 +1,16 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
+import '../models/trip_storage.dart';
 import '../models/trip_data.dart';
 import 'trip_summary_screen.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/vehicle_profile.dart';
 import '../services/gpsservice.dart';
 
@@ -19,7 +23,8 @@ class MapScreen extends StatefulWidget {
   State<MapScreen> createState() => _MapScreenState();
 }
 
-class _MapScreenState extends State<MapScreen> {
+class _MapScreenState extends State<MapScreen>
+    with WidgetsBindingObserver, TickerProviderStateMixin {
   final MapController _mapController = MapController();
   final TextEditingController _searchController = TextEditingController();
   LatLng _currentPosition = const LatLng(48.8566, 2.3522);
@@ -32,12 +37,17 @@ class _MapScreenState extends State<MapScreen> {
   List<RouteResult> _routeAlternatives = [];
   int _selectedRouteIndex = 0;
   bool _routeValidated = false;
+  LatLng? _destination;
 
   // Index de l'étape de navigation en cours (0 = depart, 1 = premier manœuvre)
   int _navStepIndex = 1;
 
   // Cap de déplacement (en degrés, nord = 0)
   double _bearing = 0.0;
+  static const double _minReliableHeadingSpeedMs = 1.4; // ~5 km/h
+  static const double _stationarySpeedMs = 0.8; // ~3 km/h
+  static const double _minGpsMoveForHeadingM = 6.0;
+  static const double _minTripDistanceDeltaM = 3.0;
 
   // Vrai si la carte suit automatiquement le GPS pendant la navigation
   bool _isFollowing = false;
@@ -48,8 +58,13 @@ class _MapScreenState extends State<MapScreen> {
   // Drapeau pour autoriser la rotation automatique de la carte
   bool _shouldAutoRotate = false;
 
-  // Dernière position utilisée pour recentrer (évite les micro-mouvements)
-  LatLng? _lastFollowedPosition;
+  // Ticker 60fps pour un suivi caméra fluide avec dead reckoning
+  late final Ticker _cameraTicker;
+  double _cameraFollowZoom = 17.0;
+  Duration? _prevCameraTickElapsed;
+
+  // Lissage EMA de la position affichée (anti micro-tremblements GPS)
+  LatLng? _smoothedPos;
   double _speedKmh = 0.0;
   double _lastSpeedMs = 0.0;
   double _lastAltitude = 0.0;
@@ -72,9 +87,9 @@ class _MapScreenState extends State<MapScreen> {
 
   // Debounce timer pour les recherches
   Timer? _searchDebounceTimer;
-
-  // Dernière distance connue à l'étape actuelle (pour hystérésis du recalage)
-  double? _lastStepDistance;
+  StreamSubscription<Position>? _positionSubscription;
+  Timer? _gpsRetryTimer;
+  bool _isStartingLocationStream = false;
 
   // Distance affichée à l'étape actuelle (arrondie aux seuils)
   double _displayedStepDistance = 0.0;
@@ -82,10 +97,16 @@ class _MapScreenState extends State<MapScreen> {
   // Temps et distance restants (mis à jour en temps réel)
   int _remainingDurationMin = 0;
   double _remainingDistanceKm = 0.0;
+  bool _isRerouting = false;
+  DateTime? _offRouteSince;
+  DateTime? _lastRerouteAt;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _cameraTicker = createTicker(_onCameraFollowTick)..start();
+    _setKeepScreenAwake(true);
     _initTts();
     _initLocation();
   }
@@ -104,53 +125,303 @@ class _MapScreenState extends State<MapScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _setKeepScreenAwake(false);
     _tts.stop();
+    _cameraTicker.dispose();
+    _positionSubscription?.cancel();
+    _gpsRetryTimer?.cancel();
     _searchController.dispose();
     _polylineHitNotifier.dispose();
     _searchDebounceTimer?.cancel();
     super.dispose();
   }
 
+  @override
+  void didChangeMetrics() {
+    super.didChangeMetrics();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_routeValidated || !_isFollowing) return;
+      _mapController.move(
+        _predictedFollowTarget(_currentPosition, _bearing, _lastSpeedMs),
+        17.0,
+      );
+      if (_shouldAutoRotate) {
+        _rotateMapToBearing(_bearing);
+      }
+    });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _positionSubscription == null) {
+      _initLocation();
+    }
+  }
+
+  Future<void> _setKeepScreenAwake(bool enabled) async {
+    try {
+      await WakelockPlus.toggle(enable: enabled);
+    } catch (_) {
+      // The app can still navigate if wakelock is unavailable on a platform.
+    }
+  }
+
   Future<void> _initLocation() async {
     final granted = await GpsService.checkAndRequestPermission();
     if (!granted) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Permission de localisation refusée. L\'application ne peut pas fonctionner sans elle.',
-            ),
-            backgroundColor: Colors.red,
-            duration: Duration(seconds: 5),
-          ),
-        );
-      }
+      _showLocationUnavailableMessage();
       return;
     }
-    GpsService.getPositionStream().listen((Position position) {
-      if (!mounted) return;
-      final pos = LatLng(position.latitude, position.longitude);
-      final bearing = position.heading;
-      final speedMs = position.speed.clamp(0.0, 83.0);
-      final speedKmh = (speedMs * 3.6).clamp(0.0, 300.0);
-      final now = DateTime.now();
-      final altitude = position.altitude;
+    _gpsRetryTimer?.cancel();
+    if (_isStartingLocationStream) return;
+    _isStartingLocationStream = true;
 
-      double acceleration = 0.0;
-      double altitudeDelta = 0.0;
-      double distanceDelta = 1.0;
+    try {
+      await _positionSubscription?.cancel();
+      _positionSubscription = GpsService.getPositionStream().listen(
+        _handlePosition,
+        onError: _handleGpsError,
+        cancelOnError: false,
+      );
+    } catch (_) {
+      _handleGpsError('Impossible de demarrer le GPS');
+    } finally {
+      _isStartingLocationStream = false;
+    }
+  }
+
+  void _showLocationUnavailableMessage() {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text(
+          'Active la localisation et autorise son acces pour utiliser la carte.',
+        ),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: 'Reglages',
+          textColor: Colors.white,
+          onPressed: () => Geolocator.openLocationSettings(),
+        ),
+      ),
+    );
+  }
+
+  void _handleGpsError(Object error) {
+    _positionSubscription?.cancel();
+    _positionSubscription = null;
+    _gpsRetryTimer?.cancel();
+    _gpsRetryTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) _initLocation();
+    });
+  }
+
+  // Ticker 60fps : dead reckoning + lissage exponentiel de la caméra
+  void _onCameraFollowTick(Duration elapsed) {
+    if (!_shouldAutoFollow || !_isFollowing) {
+      _prevCameraTickElapsed = null;
+      return;
+    }
+
+    final prev = _prevCameraTickElapsed;
+    _prevCameraTickElapsed = elapsed;
+    if (!mounted || prev == null) return;
+
+    final dt = (elapsed - prev).inMicroseconds / 1000000.0;
+    if (dt <= 0 || dt > 0.5) return;
+
+    LatLng target;
+    if (_routeValidated) {
+      // Dead reckoning : extrapoler la position entre les mises à jour GPS
+      LatLng estimated = _currentPosition;
+      if (_lastGpsTime != null && _lastSpeedMs >= _stationarySpeedMs) {
+        final secSinceGps =
+            DateTime.now().difference(_lastGpsTime!).inMilliseconds / 1000.0;
+        if (secSinceGps > 0.05 && secSinceGps < 2.0) {
+          estimated = _projectPosition(
+            _currentPosition,
+            _bearing,
+            (_lastSpeedMs * secSinceGps).clamp(0.0, 40.0),
+          );
+        }
+      }
+      target = _predictedFollowTarget(estimated, _bearing, _lastSpeedMs);
+    } else {
+      target = _currentPosition;
+    }
+
+    // Lissage exponentiel : tau = 0.2s → atteint 98% en 1 seconde
+    final alpha = 1.0 - math.exp(-dt / 0.2);
+    try {
+      final current = _mapController.camera.center;
+      final next = _lerpLatLng(current, target, alpha);
+      _mapController.move(next, _cameraFollowZoom);
+    } catch (_) {}
+  }
+
+  LatLng _lerpLatLng(LatLng a, LatLng b, double t) {
+    return LatLng(
+      a.latitude + (b.latitude - a.latitude) * t,
+      a.longitude + (b.longitude - a.longitude) * t,
+    );
+  }
+
+  // Projette une position à `distanceM` mètres dans la direction `bearingDeg`
+  LatLng _projectPosition(LatLng from, double bearingDeg, double distanceM) {
+    if (distanceM < 0.1 || bearingDeg.isNaN || bearingDeg < 0) return from;
+    const earthRadiusM = 6378137.0;
+    final bearingRad = bearingDeg * math.pi / 180.0;
+    final lat1 = from.latitude * math.pi / 180.0;
+    final lon1 = from.longitude * math.pi / 180.0;
+    final angularDistance = distanceM / earthRadiusM;
+    final lat2 = math.asin(
+      math.sin(lat1) * math.cos(angularDistance) +
+          math.cos(lat1) * math.sin(angularDistance) * math.cos(bearingRad),
+    );
+    final lon2 =
+        lon1 +
+        math.atan2(
+          math.sin(bearingRad) * math.sin(angularDistance) * math.cos(lat1),
+          math.cos(angularDistance) - math.sin(lat1) * math.sin(lat2),
+        );
+    return LatLng(
+      lat2 * 180.0 / math.pi,
+      ((lon2 * 180.0 / math.pi + 540.0) % 360.0) - 180.0,
+    );
+  }
+
+  LatLng _predictedFollowTarget(LatLng pos, double bearingDeg, double speedMs) {
+    if (speedMs < 1.4 || bearingDeg.isNaN || bearingDeg < 0) return pos;
+    final lookAheadM = (speedMs * 2.2).clamp(18.0, 85.0);
+    return _projectPosition(pos, bearingDeg, lookAheadM);
+  }
+
+  double _stableBearing(
+    Position position,
+    LatLng pos,
+    double speedMs,
+    double gpsDeltaM,
+  ) {
+    final rawHeading = position.heading;
+    final hasReliableHeading = rawHeading.isFinite && rawHeading >= 0;
+
+    if (speedMs >= _minReliableHeadingSpeedMs && hasReliableHeading) {
+      return _smoothBearing(_bearing, rawHeading, 0.35);
+    }
+
+    if (_lastGpsPos != null && gpsDeltaM >= _minGpsMoveForHeadingM) {
+      final gpsBearing = Geolocator.bearingBetween(
+        _lastGpsPos!.latitude,
+        _lastGpsPos!.longitude,
+        pos.latitude,
+        pos.longitude,
+      );
+      if (gpsBearing.isFinite) {
+        return _smoothBearing(_bearing, gpsBearing, 0.25);
+      }
+    }
+
+    return _bearing;
+  }
+
+  double _smoothBearing(double current, double target, double factor) {
+    final delta = ((target - current + 540.0) % 360.0) - 180.0;
+    return (current + delta * factor + 360.0) % 360.0;
+  }
+
+  double _visibleMarkerBearing(double bearingDeg) {
+    return _shouldAutoRotate && _isFollowing ? 0.0 : bearingDeg;
+  }
+
+  void _rotateMapToBearing(double bearingDeg) {
+    if (!bearingDeg.isFinite || bearingDeg < 0) return;
+
+    try {
+      final current = _mapController.camera.rotation;
+      final delta = (((bearingDeg - current + 540.0) % 360.0) - 180.0).abs();
+      if (delta >= 3.0) {
+        _mapController.rotate(bearingDeg);
+      }
+    } catch (_) {
+      _mapController.rotate(bearingDeg);
+    }
+  }
+
+  void _handlePosition(Position position) {
+    if (!mounted) return;
+    final pos = LatLng(position.latitude, position.longitude);
+    final rawSpeedMs = position.speed.clamp(0.0, 83.0);
+    final now = DateTime.now();
+    final altitude = position.altitude;
+    final gpsDeltaM = _lastGpsPos == null
+        ? double.infinity
+        : Geolocator.distanceBetween(
+            _lastGpsPos!.latitude,
+            _lastGpsPos!.longitude,
+            pos.latitude,
+            pos.longitude,
+          );
+    final isStationaryJitter =
+        _lastGpsPos != null &&
+        rawSpeedMs < _stationarySpeedMs &&
+        gpsDeltaM < _minGpsMoveForHeadingM;
+    final speedMs = isStationaryJitter ? 0.0 : rawSpeedMs;
+    final speedKmh = (speedMs * 3.6).clamp(0.0, 300.0);
+
+    // Filtre EMA : lisse la position affichée pour éliminer les micro-tremblements
+    // alpha bas = plus de lissage (vitesse faible), alpha élevé = suivi fidèle (vitesse élevée)
+    if (!isStationaryJitter) {
+      final emaAlpha = speedMs < 2.0 ? 0.25 : (speedMs < 6.0 ? 0.5 : 0.85);
+      _smoothedPos = _smoothedPos == null
+          ? pos
+          : _lerpLatLng(_smoothedPos!, pos, emaAlpha);
+    }
+    final displayPos = isStationaryJitter ? _currentPosition : (_smoothedPos ?? pos);
+    final bearing = _stableBearing(position, pos, speedMs, gpsDeltaM);
+
+    double acceleration = 0.0;
+    double altitudeDelta = 0.0;
+    double distanceDelta = 1.0;
+
+    if (_lastGpsTime != null) {
+      final dt = now.difference(_lastGpsTime!).inMilliseconds / 1000.0;
+      if (dt > 0.05) {
+        acceleration = (speedMs - _lastSpeedMs) / dt;
+        altitudeDelta = position.altitude - _lastAltitude;
+        distanceDelta = speedMs * dt;
+      }
+    }
+
+    if (widget.vehicleProfile != null) {
+      _instantLph = widget.vehicleProfile!.estimateInstantConsumptionLph(
+        speedMs: speedMs,
+        accelerationMs2: acceleration,
+        altitudeDeltaM: altitudeDelta,
+        distanceDeltaM: distanceDelta,
+      );
+    }
+
+    setState(() {
+      _currentPosition = displayPos;
+      _bearing = bearing;
+      _speedKmh = speedKmh;
 
       if (_lastGpsTime != null) {
         final dt = now.difference(_lastGpsTime!).inMilliseconds / 1000.0;
         if (dt > 0.05) {
+          // Évite la division par zéro
           acceleration = (speedMs - _lastSpeedMs) / dt;
           altitudeDelta = position.altitude - _lastAltitude;
           distanceDelta = speedMs * dt;
         }
       }
 
+      double instantLph = 0.5;
       if (widget.vehicleProfile != null) {
-        _instantLph = widget.vehicleProfile!.estimateInstantConsumptionLph(
+        instantLph = widget.vehicleProfile!.estimateInstantConsumptionLph(
           speedMs: speedMs,
           accelerationMs2: acceleration,
           altitudeDeltaM: altitudeDelta,
@@ -158,253 +429,368 @@ class _MapScreenState extends State<MapScreen> {
         );
       }
 
-      setState(() {
-        _currentPosition = pos;
-        _bearing = bearing;
-        _speedKmh = speedKmh;
-
-        if (_lastGpsTime != null) {
-          final dt = now.difference(_lastGpsTime!).inMilliseconds / 1000.0;
-          if (dt > 0.05) {
-            // Évite la division par zéro
-            acceleration = (speedMs - _lastSpeedMs) / dt;
-            altitudeDelta = position.altitude - _lastAltitude;
-            distanceDelta = speedMs * dt;
-          }
+      if (_routeValidated && _lastGpsPos != null) {
+        if (gpsDeltaM >= _minTripDistanceDeltaM &&
+            gpsDeltaM < 200 &&
+            speedMs >= _stationarySpeedMs) {
+          _tripDistanceKm += gpsDeltaM / 1000.0;
         }
+      }
 
-        double instantLph = 0.5;
-        if (widget.vehicleProfile != null) {
-          instantLph = widget.vehicleProfile!.estimateInstantConsumptionLph(
-            speedMs: speedMs,
-            accelerationMs2: acceleration,
-            altitudeDeltaM: altitudeDelta,
-            distanceDeltaM: distanceDelta,
-          );
-        }
+      if (_routeValidated) {
+        _tripRecorder.addPoint(
+          speedKmh: speedKmh,
+          instantLph: instantLph,
+          altitude: altitude,
+          accelerationMs2: acceleration,
+        );
+      }
+      _instantLph = instantLph;
+      _lastSpeedMs = speedMs;
+      _lastAltitude = altitude;
+      _lastGpsTime = now;
+      _lastGpsPos = pos;
 
-        if (_routeValidated && _lastGpsPos != null) {
-          final delta = Geolocator.distanceBetween(
-            _lastGpsPos!.latitude,
-            _lastGpsPos!.longitude,
-            pos.latitude,
-            pos.longitude,
-          );
-          if (delta < 200) {
-            _tripDistanceKm += delta / 1000.0;
-          }
-        }
-
-        if (_routeValidated) {
-          _tripRecorder.addPoint(
-            speedKmh: speedKmh,
-            instantLph: _instantLph,
-            altitude: altitude,
-            accelerationMs2: acceleration,
-          );
-        }
-        _lastSpeedMs = speedMs;
-        _lastAltitude = altitude;
-        _lastGpsTime = now;
-        _lastGpsPos = pos;
-
-        setState(() {
-          _instantLph = instantLph;
-          _lastSpeedMs = speedMs;
-          _lastAltitude = position.altitude;
-          _lastGpsTime = now;
-        });
-        _markers = [
-          ..._markers.where((m) => m.key != const ValueKey('current')),
-          Marker(
-            key: const ValueKey('current'),
-            point: pos,
-            width: 60,
-            height: 60,
-            child: _routeValidated
-                ? _buildArrowMarker(bearing)
-                : Stack(
-                    alignment: Alignment.center,
-                    children: [
-                      // Halo de précision (cercle externe semi-transparent)
-                      Container(
-                        width: 60,
-                        height: 60,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.blue.withValues(alpha: 0.15),
-                          border: Border.all(
-                            color: Colors.blue.withValues(alpha: 0.25),
-                            width: 1,
+      _markers = [
+        ..._markers.where((m) => m.key != const ValueKey('current')),
+        Marker(
+          key: const ValueKey('current'),
+          point: displayPos,
+          width: 60,
+          height: 60,
+          rotate: true,
+          child: _routeValidated
+              ? _buildArrowMarker(_visibleMarkerBearing(bearing))
+              : Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    // Halo de précision (cercle externe semi-transparent)
+                    Container(
+                      width: 60,
+                      height: 60,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.blue.withValues(alpha: 0.15),
+                        border: Border.all(
+                          color: Colors.blue.withValues(alpha: 0.25),
+                          width: 1,
+                        ),
+                      ),
+                    ),
+                    // Anneau blanc avec ombre
+                    Container(
+                      width: 22,
+                      height: 22,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Colors.white,
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black26,
+                            blurRadius: 6,
+                            offset: Offset(0, 2),
                           ),
-                        ),
+                        ],
                       ),
-                      // Anneau blanc avec ombre
-                      Container(
-                        width: 22,
-                        height: 22,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Colors.white,
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black26,
-                              blurRadius: 6,
-                              offset: Offset(0, 2),
-                            ),
-                          ],
-                        ),
+                    ),
+                    // Point bleu central
+                    Container(
+                      width: 14,
+                      height: 14,
+                      decoration: const BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: Color(0xFF1A73E8),
                       ),
-                      // Point bleu central
-                      Container(
-                        width: 14,
-                        height: 14,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: Color(0xFF1A73E8),
-                        ),
-                      ),
-                    ],
-                  ),
-          ),
-        ];
-      });
-      // Recentre : uniquement si le suivi automatique est activé pendant la navigation
-      // Seuil de 10 m pour éviter les micro-mouvements GPS
-      final double movedDist = _lastFollowedPosition == null
-          ? double.infinity
-          : Geolocator.distanceBetween(
-              _lastFollowedPosition!.latitude,
-              _lastFollowedPosition!.longitude,
-              pos.latitude,
-              pos.longitude,
-            );
-      if (_shouldAutoFollow && movedDist >= 10.0) {
-        if (_routeValidated && _isFollowing) {
-          _mapController.move(pos, 17.0);
-          _lastFollowedPosition = pos;
-        }
-      }
+                    ),
+                  ],
+                ),
+        ),
+      ];
+    });
+    // La caméra est gérée par le ticker _onCameraFollowTick (dead reckoning 60fps)
 
-      // Rotation automatique de la carte en fonction du cap GPS
-      if (_shouldAutoRotate && _isFollowing) {
-        final radians = bearing * 3.141592653589793 / 180.0;
-        _mapController.rotate(radians);
-      }
+    // Rotation automatique de la carte en fonction du cap GPS
+    if (_shouldAutoRotate &&
+        _isFollowing &&
+        speedMs >= _minReliableHeadingSpeedMs) {
+      _rotateMapToBearing(bearing);
+    }
 
-      // Avancement automatique des étapes de navigation + annonces vocales
-      if (_routeValidated && _routeAlternatives.isNotEmpty) {
-        final steps = _routeAlternatives[_selectedRouteIndex].steps;
+    // Avancement automatique des étapes de navigation + annonces vocales
+    _checkOffRouteAndMaybeReroute(pos, position.accuracy, speedMs);
+    if (_isRerouting) {
+      _calculateRemaining(pos);
+      return;
+    }
 
-        // ── RECALAGE AVEC HYSTÉRÉSIS : évite de changer d'étape à cause des imprécisions GPS ──
-        // Ne change d'étape que si on est au moins 50m plus proche
-        if (steps.length > 2 && _navStepIndex < steps.length) {
-          // Distance à l'étape actuelle
-          final currentStepDist = Geolocator.distanceBetween(
+    if (_routeValidated && _routeAlternatives.isNotEmpty) {
+      final steps = _routeAlternatives[_selectedRouteIndex].steps;
+
+      // ── RECALAGE AVEC HYSTÉRÉSIS : évite de changer d'étape à cause des imprécisions GPS ──
+      // Ne change d'étape que si on est au moins 50m plus proche
+      if (steps.length > 2 && _navStepIndex < steps.length) {
+        // Distance à l'étape actuelle
+        final currentStepDist = Geolocator.distanceBetween(
+          pos.latitude,
+          pos.longitude,
+          steps[_navStepIndex].location.latitude,
+          steps[_navStepIndex].location.longitude,
+        );
+
+        int bestIdx = _navStepIndex;
+        double bestDist = currentStepDist;
+
+        // On cherche dans une fenêtre : étape actuelle à +5
+        // (on ne cherche pas en arrière pour éviter de reculer)
+        final searchFrom = _navStepIndex;
+        final searchTo = (_navStepIndex + 5).clamp(
+          _navStepIndex,
+          steps.length - 1,
+        );
+
+        for (int i = searchFrom; i <= searchTo; i++) {
+          final d = Geolocator.distanceBetween(
             pos.latitude,
             pos.longitude,
-            steps[_navStepIndex].location.latitude,
-            steps[_navStepIndex].location.longitude,
+            steps[i].location.latitude,
+            steps[i].location.longitude,
           );
-
-          int bestIdx = _navStepIndex;
-          double bestDist = currentStepDist;
-
-          // On cherche dans une fenêtre : étape actuelle à +5
-          // (on ne cherche pas en arrière pour éviter de reculer)
-          final searchFrom = _navStepIndex;
-          final searchTo = (_navStepIndex + 5).clamp(
-            _navStepIndex,
-            steps.length - 1,
-          );
-
-          for (int i = searchFrom; i <= searchTo; i++) {
-            final d = Geolocator.distanceBetween(
-              pos.latitude,
-              pos.longitude,
-              steps[i].location.latitude,
-              steps[i].location.longitude,
-            );
-            if (d < bestDist) {
-              bestDist = d;
-              bestIdx = i;
-            }
+          if (d < bestDist) {
+            bestDist = d;
+            bestIdx = i;
           }
+        }
 
-          // Ne change d'étape que si on est au moins 50m plus proche
-          // (hystérésis : évite les oscillations GPS sur lignes droites)
-          if (bestIdx > _navStepIndex && (currentStepDist - bestDist) > 50.0) {
+        // Ne change d'étape que si on est au moins 50m plus proche
+        // (hystérésis : évite les oscillations GPS sur lignes droites)
+        if (bestIdx > _navStepIndex && (currentStepDist - bestDist) > 50.0) {
+          setState(() {
+            _navStepIndex = bestIdx;
+            _announced300 = false;
+            _announced100 = false;
+          });
+          _speak(_stepInstructionShort(steps[bestIdx]));
+        }
+      }
+      // ── FIN RECALAGE ───────────────────────────────────────────────
+
+      if (_navStepIndex < steps.length - 1) {
+        final target = steps[_navStepIndex].location;
+        final dist = Geolocator.distanceBetween(
+          pos.latitude,
+          pos.longitude,
+          target.latitude,
+          target.longitude,
+        );
+
+        // Arrondir la distance pour l'affichage et mettre à jour si elle a changé
+        final roundedDist = _roundDisplayDistance(dist);
+        if (roundedDist != _displayedStepDistance) {
+          setState(() {
+            _displayedStepDistance = roundedDist;
+          });
+        }
+
+        // Annonce à 300 m
+        if (dist <= 300 && !_announced300) {
+          _announced300 = true;
+          _speak(
+            'Dans ${_formatDistance(dist / 1000)}, '
+            '${_stepInstructionShort(steps[_navStepIndex])}',
+          );
+        }
+        // Annonce à 100 m
+        if (dist <= 100 && !_announced100) {
+          _announced100 = true;
+          _speak('Bientôt, ${_stepInstructionShort(steps[_navStepIndex])}');
+        }
+        // Passage à l'étape suivante (seuil abaissé à 20 m pour plus de réactivité)
+        if (dist < 20 && mounted) {
+          final nextIdx = _navStepIndex + 1;
+          if (nextIdx >= steps.length) {
+            _speak('Vous êtes arrivé à destination.');
+            Future.delayed(const Duration(seconds: 2), () {
+              if (mounted) _clearRoute(arrived: true);
+            });
+          } else {
             setState(() {
-              _navStepIndex = bestIdx;
+              _navStepIndex = nextIdx;
               _announced300 = false;
               _announced100 = false;
-              _lastStepDistance = bestDist;
             });
-            _speak(_stepInstructionShort(steps[bestIdx]));
-          }
-        }
-        // ── FIN RECALAGE ───────────────────────────────────────────────
-
-        if (_navStepIndex < steps.length - 1) {
-          final target = steps[_navStepIndex].location;
-          final dist = Geolocator.distanceBetween(
-            pos.latitude,
-            pos.longitude,
-            target.latitude,
-            target.longitude,
-          );
-
-          // Arrondir la distance pour l'affichage et mettre à jour si elle a changé
-          final roundedDist = _roundDisplayDistance(dist);
-          if (roundedDist != _displayedStepDistance) {
-            setState(() {
-              _displayedStepDistance = roundedDist;
-            });
-          }
-
-          // Annonce à 300 m
-          if (dist <= 300 && !_announced300) {
-            _announced300 = true;
-            _speak(
-              'Dans ${_formatDistance(dist / 1000)}, '
-              '${_stepInstructionShort(steps[_navStepIndex])}',
-            );
-          }
-          // Annonce à 100 m
-          if (dist <= 100 && !_announced100) {
-            _announced100 = true;
-            _speak('Bientôt, ${_stepInstructionShort(steps[_navStepIndex])}');
-          }
-          // Passage à l'étape suivante (seuil abaissé à 20 m pour plus de réactivité)
-          if (dist < 20 && mounted) {
-            final nextIdx = _navStepIndex + 1;
-            if (nextIdx >= steps.length) {
+            if (steps[nextIdx].maneuverType == 'arrive') {
               _speak('Vous êtes arrivé à destination.');
               Future.delayed(const Duration(seconds: 2), () {
                 if (mounted) _clearRoute(arrived: true);
               });
             } else {
-              setState(() {
-                _navStepIndex = nextIdx;
-                _announced300 = false;
-                _announced100 = false;
-              });
-              if (steps[nextIdx].maneuverType == 'arrive') {
-                _speak('Vous êtes arrivé à destination.');
-                Future.delayed(const Duration(seconds: 2), () {
-                  if (mounted) _clearRoute(arrived: true);
-                });
-              } else {
-                _speak(_stepInstructionShort(steps[nextIdx]));
-              }
+              _speak(_stepInstructionShort(steps[nextIdx]));
             }
           }
         }
       }
+    }
 
-      // Mettre à jour le temps et la distance restants en continu
-      _calculateRemaining(pos);
+    // Mettre à jour le temps et la distance restants en continu
+    _calculateRemaining(pos);
+  }
+
+  void _checkOffRouteAndMaybeReroute(
+    LatLng pos,
+    double accuracyM,
+    double speedMs,
+  ) {
+    if (!_routeValidated ||
+        _routeAlternatives.isEmpty ||
+        _destination == null) {
+      _offRouteSince = null;
+      return;
+    }
+    if (_isRerouting) return;
+    if (speedMs < _minReliableHeadingSpeedMs) {
+      _offRouteSince = null;
+      return;
+    }
+
+    final distanceToDestination = Geolocator.distanceBetween(
+      pos.latitude,
+      pos.longitude,
+      _destination!.latitude,
+      _destination!.longitude,
+    );
+    if (distanceToDestination < 60) {
+      _offRouteSince = null;
+      return;
+    }
+
+    final route = _routeAlternatives[_selectedRouteIndex];
+    final distanceToRouteM = _distanceToPolylineM(pos, route.points);
+    final thresholdM = math.max(45.0, accuracyM * 2.2);
+    if (distanceToRouteM <= thresholdM) {
+      _offRouteSince = null;
+      return;
+    }
+
+    final now = DateTime.now();
+    _offRouteSince ??= now;
+    final offRouteDuration = now.difference(_offRouteSince!);
+    final isCooldownDone =
+        _lastRerouteAt == null ||
+        now.difference(_lastRerouteAt!) > const Duration(seconds: 18);
+
+    if (offRouteDuration >= const Duration(seconds: 5) && isCooldownDone) {
+      _recalculateRouteFromCurrentPosition(pos);
+    }
+  }
+
+  Future<void> _recalculateRouteFromCurrentPosition(LatLng start) async {
+    final destination = _destination;
+    if (destination == null || _isRerouting) return;
+
+    _isRerouting = true;
+    _lastRerouteAt = DateTime.now();
+    _offRouteSince = null;
+    if (mounted) {
+      setState(() => _isCalculatingRoute = true);
+    }
+
+    final alternatives = await GpsService.getRoutes(start, destination);
+    if (!mounted) return;
+    if (!_routeValidated || _destination != destination) {
+      _isRerouting = false;
+      return;
+    }
+
+    if (alternatives.isEmpty) {
+      setState(() {
+        _isRerouting = false;
+        _isCalculatingRoute = false;
+      });
+      return;
+    }
+
+    final route = alternatives.first;
+    final steps = route.steps;
+    final startIdx = steps.length > 1 ? 1 : 0;
+    final initialStepDistance = steps.isEmpty
+        ? 0.0
+        : Geolocator.distanceBetween(
+            start.latitude,
+            start.longitude,
+            steps[startIdx].location.latitude,
+            steps[startIdx].location.longitude,
+          );
+
+    setState(() {
+      _routeAlternatives = alternatives;
+      _selectedRouteIndex = 0;
+      _routeValidated = true;
+      _isRerouting = false;
+      _isCalculatingRoute = false;
+      _navStepIndex = startIdx;
+      _announced300 = false;
+      _announced100 = false;
+      _displayedStepDistance = _roundDisplayDistance(initialStepDistance);
+      _remainingDurationMin = route.durationMin;
+      _remainingDistanceKm = route.distanceKm;
     });
+
+    if (_isFollowing) {
+      _cameraFollowZoom = 17.0;
+      _prevCameraTickElapsed = null;
+    }
+
+    if (steps.isNotEmpty) {
+      _speak('Itineraire recalcule. ${_stepInstructionShort(steps[startIdx])}');
+    } else {
+      _speak('Itineraire recalcule.');
+    }
+  }
+
+  double _distanceToPolylineM(LatLng point, List<LatLng> polyline) {
+    if (polyline.isEmpty) return double.infinity;
+    if (polyline.length == 1) {
+      return Geolocator.distanceBetween(
+        point.latitude,
+        point.longitude,
+        polyline.first.latitude,
+        polyline.first.longitude,
+      );
+    }
+
+    var minDistance = double.infinity;
+    for (int i = 0; i < polyline.length - 1; i++) {
+      final distance = _distanceToSegmentM(point, polyline[i], polyline[i + 1]);
+      if (distance < minDistance) minDistance = distance;
+    }
+    return minDistance;
+  }
+
+  double _distanceToSegmentM(LatLng point, LatLng a, LatLng b) {
+    const metersPerDegreeLat = 111320.0;
+    final latRad = point.latitude * math.pi / 180.0;
+    final metersPerDegreeLon = metersPerDegreeLat * math.cos(latRad);
+
+    final px = point.longitude * metersPerDegreeLon;
+    final py = point.latitude * metersPerDegreeLat;
+    final ax = a.longitude * metersPerDegreeLon;
+    final ay = a.latitude * metersPerDegreeLat;
+    final bx = b.longitude * metersPerDegreeLon;
+    final by = b.latitude * metersPerDegreeLat;
+
+    final dx = bx - ax;
+    final dy = by - ay;
+    if (dx == 0 && dy == 0) {
+      return math.sqrt(math.pow(px - ax, 2) + math.pow(py - ay, 2));
+    }
+
+    final t = (((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)).clamp(
+      0.0,
+      1.0,
+    );
+    final closestX = ax + t * dx;
+    final closestY = ay + t * dy;
+    return math.sqrt(math.pow(px - closestX, 2) + math.pow(py - closestY, 2));
   }
 
   /// Lance une recherche avec debounce (attend 600ms après la fin de la frappe).
@@ -478,6 +864,10 @@ class _MapScreenState extends State<MapScreen> {
       _routeAlternatives = [];
       _selectedRouteIndex = 0;
       _routeValidated = false;
+      _destination = dest;
+      _isRerouting = false;
+      _offRouteSince = null;
+      _lastRerouteAt = null;
       _displayedStepDistance = 0.0;
     });
 
@@ -507,7 +897,7 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  void _clearRoute({bool arrived = false}) {
+  Future<void> _clearRoute({bool arrived = false}) async {
     _tts.stop();
     if (arrived && _tripRecorder.isRecording) {
       final route = _routeAlternatives[_selectedRouteIndex];
@@ -520,17 +910,20 @@ class _MapScreenState extends State<MapScreen> {
       );
 
       if (summary != null && mounted) {
-        Navigator.of(context).push(
-          PageRouteBuilder(
-            pageBuilder: (_, animation, __) => TripSummaryScreen(
-              summary: summary,
-              onClose: () => Navigator.of(context).pop(),
+        await TripStorage.save(StoredTrip.fromSummary(summary));
+        if (mounted) {
+          Navigator.of(context).push(
+            PageRouteBuilder(
+              pageBuilder: (_, animation, _) => TripSummaryScreen(
+                summary: summary,
+                onClose: () => Navigator.of(context).pop(),
+              ),
+              transitionsBuilder: (_, animation, _, child) =>
+                  FadeTransition(opacity: animation, child: child),
+              transitionDuration: const Duration(milliseconds: 400),
             ),
-            transitionsBuilder: (_, animation, __, child) =>
-                FadeTransition(opacity: animation, child: child),
-            transitionDuration: const Duration(milliseconds: 400),
-          ),
-        );
+          );
+        }
       } else {
         _tripRecorder.finish(
           realDistanceKm: _tripDistanceKm,
@@ -543,13 +936,18 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _resetRouteState() {
+    _prevCameraTickElapsed = null;
     setState(() {
       _routeAlternatives = [];
       _selectedRouteIndex = 0;
       _routeValidated = false;
+      _destination = null;
       _isFollowing = false;
       _shouldAutoFollow = false;
       _shouldAutoRotate = false;
+      _isRerouting = false;
+      _offRouteSince = null;
+      _lastRerouteAt = null;
       _navStepIndex = 1;
       _announced300 = false;
       _announced100 = false;
@@ -558,6 +956,7 @@ class _MapScreenState extends State<MapScreen> {
       _remainingDistanceKm = 0.0;
       _tripDistanceKm = 0.0;
       _lastGpsPos = null;
+      _smoothedPos = null;
       _markers = [
         ..._markers.where(
           (m) =>
@@ -617,6 +1016,15 @@ class _MapScreenState extends State<MapScreen> {
 
   void _validateRoute() {
     final steps = _routeAlternatives[_selectedRouteIndex].steps;
+    final startIdx = steps.length > 1 ? 1 : 0;
+    final initialStepDistance = steps.isEmpty
+        ? 0.0
+        : Geolocator.distanceBetween(
+            _currentPosition.latitude,
+            _currentPosition.longitude,
+            steps[startIdx].location.latitude,
+            steps[startIdx].location.longitude,
+          );
 
     _tripRecorder.start();
     _tripDistanceKm = 0.0;
@@ -627,11 +1035,10 @@ class _MapScreenState extends State<MapScreen> {
       _isFollowing = true;
       _shouldAutoFollow = true;
       _shouldAutoRotate = true;
-      _navStepIndex = steps.length > 1 ? 1 : 0;
+      _navStepIndex = startIdx;
       _announced300 = false;
       _announced100 = false;
-      _lastStepDistance = null; // Réinitialiser l'hystérésis
-      _displayedStepDistance = 0.0; // Réinitialiser la distance affichée
+      _displayedStepDistance = _roundDisplayDistance(initialStepDistance);
       // Initialiser le temps et la distance restants
       final route = _routeAlternatives[_selectedRouteIndex];
       _remainingDurationMin = route.durationMin;
@@ -644,13 +1051,17 @@ class _MapScreenState extends State<MapScreen> {
           point: _currentPosition,
           width: 60,
           height: 60,
-          child: _buildArrowMarker(_bearing),
+          rotate: true,
+          child: _buildArrowMarker(_visibleMarkerBearing(_bearing)),
         ),
       ];
     });
-    _mapController.move(_currentPosition, 17.0);
+    _cameraFollowZoom = 17.0;
+    _prevCameraTickElapsed = null;
+    if (_lastSpeedMs >= _minReliableHeadingSpeedMs) {
+      _rotateMapToBearing(_bearing);
+    }
     // Annonce vocale de la première instruction
-    final startIdx = steps.length > 1 ? 1 : 0;
     if (steps.isNotEmpty) {
       _speak(_stepInstructionShort(steps[startIdx]));
     }
@@ -662,8 +1073,11 @@ class _MapScreenState extends State<MapScreen> {
       _shouldAutoFollow = true;
       _shouldAutoRotate = _routeValidated;
     });
-    _mapController.move(_currentPosition, _routeValidated ? 17.0 : 15.0);
-    _lastFollowedPosition = _currentPosition;
+    _cameraFollowZoom = _routeValidated ? 17.0 : 15.0;
+    _prevCameraTickElapsed = null;
+    if (_routeValidated && _lastSpeedMs >= _minReliableHeadingSpeedMs) {
+      _rotateMapToBearing(_bearing);
+    }
   }
 
   Widget _buildArrowMarker(double bearingDeg) {
@@ -790,7 +1204,12 @@ class _MapScreenState extends State<MapScreen> {
   @override
   Widget build(BuildContext context) {
     final hasRoutes = _routeAlternatives.isNotEmpty;
-    final bottomPadding = _routeValidated
+    final media = MediaQuery.of(context);
+    final isLandscapeLayout =
+        media.size.width > media.size.height && media.size.width >= 640;
+    final bottomPadding = isLandscapeLayout
+        ? 16.0
+        : _routeValidated
         ? 90.0
         : (hasRoutes || _isCalculatingRoute ? 220.0 : 24.0);
 
@@ -805,7 +1224,7 @@ class _MapScreenState extends State<MapScreen> {
               minZoom: 3,
               maxZoom: 19,
               onPositionChanged: (camera, hasGesture) {
-                if (hasGesture && _routeValidated && _isFollowing) {
+                if (hasGesture && _isFollowing) {
                   setState(() {
                     _isFollowing = false;
                     _shouldAutoFollow = false;
@@ -840,9 +1259,10 @@ class _MapScreenState extends State<MapScreen> {
           // Barre de recherche (masquée pendant la navigation)
           if (!_routeValidated)
             Positioned(
-              top: MediaQuery.of(context).padding.top + 8,
+              top: media.padding.top + 8,
               left: 12,
-              right: 12,
+              right: isLandscapeLayout ? null : 12,
+              width: isLandscapeLayout ? 420 : null,
               child: Column(
                 children: [
                   ClipRRect(
@@ -1021,8 +1441,9 @@ class _MapScreenState extends State<MapScreen> {
           // Panneau bas : calcul / sélection / validé
           if (_isCalculatingRoute)
             Positioned(
-              bottom: 0,
-              left: 0,
+              top: isLandscapeLayout ? media.padding.top + 96 : null,
+              bottom: isLandscapeLayout ? null : 0,
+              left: isLandscapeLayout ? null : 0,
               right: 0,
               child: _buildBottomSheet(
                 child: const Row(
@@ -1044,15 +1465,16 @@ class _MapScreenState extends State<MapScreen> {
             )
           else if (hasRoutes && !_routeValidated)
             Positioned(
+              top: isLandscapeLayout ? media.padding.top + 96 : null,
               bottom: 0,
-              left: 0,
+              left: isLandscapeLayout ? null : 0,
               right: 0,
               child: _buildSelectionPanel(),
             )
           else if (hasRoutes && _routeValidated)
             Positioned(
               bottom: 0,
-              left: 0,
+              left: isLandscapeLayout ? null : 0,
               right: 0,
               child: _buildNavBottomBar(),
             ),
@@ -1207,7 +1629,7 @@ class _MapScreenState extends State<MapScreen> {
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
               itemCount: _routeAlternatives.length,
-              separatorBuilder: (_, __) => const SizedBox(width: 10),
+              separatorBuilder: (_, _) => const SizedBox(width: 10),
               itemBuilder: (context, i) {
                 final route = _routeAlternatives[i];
                 final isSelected = i == _selectedRouteIndex;
@@ -1440,6 +1862,9 @@ class _MapScreenState extends State<MapScreen> {
   // ── Bandeau de navigation en haut ─────────────────────────────────────────
 
   Positioned _buildNavigationBanner() {
+    final media = MediaQuery.of(context);
+    final isLandscapeLayout =
+        media.size.width > media.size.height && media.size.width >= 640;
     final steps = _routeAlternatives[_selectedRouteIndex].steps;
     if (steps.isEmpty) {
       return Positioned(top: 0, child: const SizedBox.shrink());
@@ -1455,9 +1880,10 @@ class _MapScreenState extends State<MapScreen> {
         : const Color.fromARGB(255, 10, 10, 10);
 
     return Positioned(
-      top: MediaQuery.of(context).padding.top + 8,
+      top: media.padding.top + 8,
       left: 12,
-      right: 12,
+      right: isLandscapeLayout ? null : 12,
+      width: isLandscapeLayout ? 430 : null,
       child: Material(
         elevation: 6,
         borderRadius: BorderRadius.circular(22),
@@ -1639,20 +2065,34 @@ class _MapScreenState extends State<MapScreen> {
   String _ordinalFr(int n) => n == 1 ? '1ère' : '$nème';
 
   Widget _buildBottomSheet({required Widget child}) {
+    final media = MediaQuery.of(context);
+    final isLandscapeLayout =
+        media.size.width > media.size.height && media.size.width >= 640;
+
     return Container(
-      margin: EdgeInsets.zero,
+      width: isLandscapeLayout ? 360 : null,
+      constraints: isLandscapeLayout
+          ? BoxConstraints(
+              maxHeight: media.size.height - media.padding.top - 24,
+            )
+          : null,
+      margin: isLandscapeLayout
+          ? EdgeInsets.only(right: 12, bottom: media.padding.bottom + 12)
+          : EdgeInsets.zero,
       padding: EdgeInsets.fromLTRB(
-        20,
+        isLandscapeLayout ? 16 : 20,
         0,
-        20,
-        MediaQuery.of(context).padding.bottom + 16,
+        isLandscapeLayout ? 16 : 20,
+        isLandscapeLayout ? 16 : media.padding.bottom + 16,
       ),
       decoration: BoxDecoration(
         color: Colors.white,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        borderRadius: isLandscapeLayout
+            ? BorderRadius.circular(24)
+            : const BorderRadius.vertical(top: Radius.circular(28)),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.12),
+            color: Colors.black.withValues(alpha: 0.12),
             blurRadius: 24,
             offset: const Offset(0, -4),
           ),
@@ -1673,7 +2113,10 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
-          child,
+          if (isLandscapeLayout)
+            Flexible(child: SingleChildScrollView(child: child))
+          else
+            child,
         ],
       ),
     );
