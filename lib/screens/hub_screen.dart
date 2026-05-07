@@ -2,6 +2,8 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../models/trip_storage.dart';
 import '../models/vehicle_profile.dart';
+import '../services/data_export_service.dart';
+import '../services/fuel_price_service.dart';
 import 'stats_screen.dart';
 
 class HubScreen extends StatefulWidget {
@@ -16,20 +18,34 @@ class HubScreen extends StatefulWidget {
 class _HubScreenState extends State<HubScreen> {
   List<StoredTrip> _trips = [];
   bool _loading = true;
+  FuelPrices? _fuelPrices;
+  bool _loadingPrices = true;
 
   @override
   void initState() {
     super.initState();
     _loadTrips();
+    _loadFuelPrices();
   }
 
   Future<void> _loadTrips() async {
     final trips = await TripStorage.loadAll();
-    if (mounted)
+    if (mounted) {
       setState(() {
         _trips = trips;
         _loading = false;
       });
+    }
+  }
+
+  Future<void> _loadFuelPrices() async {
+    final prices = await FuelPriceService.fetchLatest();
+    if (mounted) {
+      setState(() {
+        _fuelPrices = prices;
+        _loadingPrices = false;
+      });
+    }
   }
 
   // ── Métriques calculées depuis les vrais trajets ──────────────────────────
@@ -101,7 +117,11 @@ class _HubScreenState extends State<HubScreen> {
                       const SizedBox(height: 16),
                       _buildEcoScoreCard(),
                       const SizedBox(height: 16),
+                      _buildFuelPricesCard(),
+                      const SizedBox(height: 16),
                       _buildQuickActions(),
+                      const SizedBox(height: 16),
+                      _buildDataManagementCard(),
                       const SizedBox(height: 20),
                       _buildTripHistory(),
                     ]),
@@ -376,6 +396,126 @@ class _HubScreenState extends State<HubScreen> {
     );
   }
 
+  // ── Prix carburants ───────────────────────────────────────────────────────
+
+  Widget _buildFuelPricesCard() {
+    final fuelType = widget.vehicleProfile?.fuelType;
+
+    Widget priceChip({
+      required String label,
+      required double? price,
+      required Color color,
+      required bool highlighted,
+    }) {
+      return Expanded(
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+          decoration: BoxDecoration(
+            color: highlighted ? color.withValues(alpha: 0.12) : Colors.grey.shade50,
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: highlighted ? color.withValues(alpha: 0.4) : Colors.grey.shade200,
+              width: highlighted ? 1.5 : 1,
+            ),
+          ),
+          child: Column(
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: highlighted ? color : Colors.grey.shade600,
+                ),
+              ),
+              const SizedBox(height: 4),
+              _loadingPrices
+                  ? SizedBox(
+                      height: 16,
+                      width: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: color.withValues(alpha: 0.5),
+                      ),
+                    )
+                  : Text(
+                      price != null
+                          ? '${price.toStringAsFixed(3)} €'
+                          : '—',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                        color: highlighted ? color : Colors.grey.shade700,
+                      ),
+                    ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return _Card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.local_gas_station_rounded,
+                size: 16,
+                color: Color(0xFFFF6F00),
+              ),
+              const SizedBox(width: 6),
+              const Text(
+                'Prix carburants — semaine en cours',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Moyenne nationale hebdomadaire',
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              priceChip(
+                label: 'Gazole',
+                price: _fuelPrices?.gazole,
+                color: const Color(0xFF1565C0),
+                highlighted: fuelType == FuelType.diesel,
+              ),
+              const SizedBox(width: 8),
+              priceChip(
+                label: 'SP95',
+                price: _fuelPrices?.sp95,
+                color: const Color(0xFF2E7D32),
+                highlighted: fuelType == FuelType.essence,
+              ),
+              const SizedBox(width: 8),
+              priceChip(
+                label: 'SP98',
+                price: _fuelPrices?.sp98,
+                color: const Color(0xFFE65100),
+                highlighted: fuelType == FuelType.essence,
+              ),
+            ],
+          ),
+          if (!_loadingPrices && _fuelPrices == null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                'Données indisponibles — vérifiez votre connexion',
+                style: TextStyle(fontSize: 11, color: Colors.red.shade300),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   // ── Actions rapides ───────────────────────────────────────────────────────
 
   Widget _buildQuickActions() {
@@ -403,6 +543,141 @@ class _HubScreenState extends State<HubScreen> {
           ),
         ),
       ],
+    );
+  }
+
+  // ── Export / Import ──────────────────────────────────────────────────────
+
+  Future<void> _exportData() async {
+    try {
+      await DataExportService.exportData(
+        trips: _trips,
+        vehicleProfile: widget.vehicleProfile,
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Erreur lors de l'export.")),
+      );
+    }
+  }
+
+  Future<void> _importData() async {
+    final result = await DataExportService.importData();
+    if (!mounted) return;
+
+    if (result == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Fichier invalide ou import annulé.')),
+      );
+      return;
+    }
+
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Importer les données'),
+        content: Text(
+          '${result.trips.length} trajet(s) trouvé(s).\n\n'
+          'Voulez-vous remplacer vos données actuelles ou les fusionner ?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Annuler'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'merge'),
+            child: const Text('Fusionner'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'replace'),
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            child: const Text('Remplacer'),
+          ),
+        ],
+      ),
+    );
+
+    if (choice == null || !mounted) return;
+
+    if (choice == 'replace') {
+      await TripStorage.clearAll();
+    }
+
+    for (final trip in result.trips) {
+      await TripStorage.save(trip);
+    }
+
+    if (result.vehicleProfile != null) {
+      await result.vehicleProfile!.save();
+    }
+
+    await _loadTrips();
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          '${result.trips.length} trajet(s) importé(s) avec succès.',
+        ),
+        backgroundColor: const Color(0xFF2E7D32),
+      ),
+    );
+  }
+
+  Widget _buildDataManagementCard() {
+    return _Card(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.sync_alt_rounded, size: 16, color: Color(0xFF455A64)),
+              SizedBox(width: 6),
+              Text(
+                'Mes données',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Sauvegardez ou restaurez votre historique de trajets',
+            style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _trips.isEmpty ? null : _exportData,
+                  icon: const Icon(Icons.upload_rounded, size: 16),
+                  label: const Text('Exporter'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF2E7D32),
+                    side: const BorderSide(color: Color(0xFF2E7D32)),
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _importData,
+                  icon: const Icon(Icons.download_rounded, size: 16),
+                  label: const Text('Importer'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: const Color(0xFF1A73E8),
+                    side: const BorderSide(color: Color(0xFF1A73E8)),
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 
@@ -874,12 +1149,14 @@ class _TripDetailScreenState extends State<_TripDetailScreen> {
         ? const Color(0xFF1A73E8)
         : const Color(0xFFFF6F00);
 
-    return CustomPaint(
-      painter: _SimpleLinePainter(
-        values: values,
-        minVal: minV,
-        maxVal: maxV,
-        color: color,
+    return SizedBox.expand(
+      child: CustomPaint(
+        painter: _SimpleLinePainter(
+          values: values,
+          minVal: minV,
+          maxVal: maxV,
+          color: color,
+        ),
       ),
     );
   }

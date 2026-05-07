@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 import '../models/vehicle_profile.dart';
+import '../services/connectivity_service.dart';
+import 'no_internet_screen.dart';
+import 'location_disabled_screen.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -15,21 +18,68 @@ class _SplashScreenState extends State<SplashScreen> {
     _navigateToHome();
   }
 
+  Future<bool> _hasInternet() => ConnectivityService.hasInternet();
+
+  Future<bool> _hasLocation() => ConnectivityService.hasLocation();
+
   Future<void> _navigateToHome() async {
-    // Chargement du profil du véhicule
     final profile = await VehicleProfile.load();
 
     if (!mounted) return;
-
-    // Navigation après un délai pour laisser le temps de voir le splash
     await Future.delayed(const Duration(seconds: 2));
-
     if (!mounted) return;
 
-    // Navigation vers l'écran approprié
+    final connected = await _hasInternet();
+    if (!mounted) return;
+
+    if (!connected) {
+      _showNoInternet(profile);
+      return;
+    }
+
+    final locationOn = await _hasLocation();
+    if (!mounted) return;
+
+    if (!locationOn) {
+      _showLocationDisabled(profile);
+      return;
+    }
+
+    _goToApp(profile);
+  }
+
+  void _goToApp(VehicleProfile? profile) {
     Navigator.of(context).pushReplacementNamed(
       profile != null ? '/map' : '/setup',
       arguments: profile,
+    );
+  }
+
+  void _showNoInternet(VehicleProfile? profile) {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => NoInternetScreen(
+          onRetry: () async {
+            final locationOn = await _hasLocation();
+            if (!mounted) return;
+            if (!locationOn) {
+              _showLocationDisabled(profile);
+            } else {
+              _goToApp(profile);
+            }
+          },
+        ),
+      ),
+    );
+  }
+
+  void _showLocationDisabled(VehicleProfile? profile) {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => LocationDisabledScreen(
+          onRetry: () => _goToApp(profile),
+        ),
+      ),
     );
   }
 

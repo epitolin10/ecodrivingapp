@@ -103,4 +103,25 @@ class VehicleProfile {
   }
 
   String get fuelLabel => fuelType == FuelType.diesel ? 'Diesel' : 'Essence';
+
+  Map<String, dynamic> toJson() => {
+    'fuelType': fuelType.name,
+    'consumptionL100': consumptionL100,
+    'massKg': massKg,
+    'powerKw': powerKw,
+    'cx': cx,
+    'frontalAreaM2': frontalAreaM2,
+  };
+
+  factory VehicleProfile.fromJson(Map<String, dynamic> j) => VehicleProfile(
+    fuelType: FuelType.values.firstWhere(
+      (e) => e.name == j['fuelType'],
+      orElse: () => FuelType.essence,
+    ),
+    consumptionL100: (j['consumptionL100'] as num).toDouble(),
+    massKg: (j['massKg'] as num?)?.toDouble() ?? 1400,
+    powerKw: (j['powerKw'] as num?)?.toDouble() ?? 80,
+    cx: (j['cx'] as num?)?.toDouble() ?? 0.30,
+    frontalAreaM2: (j['frontalAreaM2'] as num?)?.toDouble() ?? 2.2,
+  );
 }

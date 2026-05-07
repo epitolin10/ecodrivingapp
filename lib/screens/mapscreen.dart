@@ -12,6 +12,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/vehicle_profile.dart';
+import '../services/fuel_price_service.dart';
 import '../services/gpsservice.dart';
 
 class MapScreen extends StatefulWidget {
@@ -28,6 +29,8 @@ class _MapScreenState extends State<MapScreen>
   final MapController _mapController = MapController();
   final TextEditingController _searchController = TextEditingController();
   LatLng _currentPosition = const LatLng(48.8566, 2.3522);
+  // Ancre GPS (dernière position lissée reçue du GPS, base pour le dead reckoning)
+  LatLng _gpsAnchorPos = const LatLng(48.8566, 2.3522);
   List<Marker> _markers = [];
   List<Map<String, dynamic>> _searchResults = [];
   bool _isSearching = false;
@@ -109,6 +112,17 @@ class _MapScreenState extends State<MapScreen>
     _setKeepScreenAwake(true);
     _initTts();
     _initLocation();
+    _loadFuelPrice();
+  }
+
+  Future<void> _loadFuelPrice() async {
+    final prices = await FuelPriceService.fetchLatest();
+    if (!mounted || prices == null) return;
+    final type = widget.vehicleProfile?.fuelType;
+    final price = type == FuelType.diesel
+        ? prices.gazole
+        : (prices.sp95 ?? prices.sp98);
+    if (price != null) setState(() => _fuelPricePerLiter = price);
   }
 
   Future<void> _initTts() async {
@@ -173,6 +187,21 @@ class _MapScreenState extends State<MapScreen>
       _showLocationUnavailableMessage();
       return;
     }
+
+    // Centrer immédiatement sur la dernière position connue (instantané, pas de délai GPS)
+    try {
+      final last = await Geolocator.getLastKnownPosition();
+      if (last != null && mounted) {
+        final pos = LatLng(last.latitude, last.longitude);
+        setState(() {
+          _currentPosition = pos;
+          _gpsAnchorPos = pos;
+          _smoothedPos = pos;
+        });
+        _mapController.move(pos, 15.0);
+      }
+    } catch (_) {}
+
     _gpsRetryTimer?.cancel();
     if (_isStartingLocationStream) return;
     _isStartingLocationStream = true;
@@ -236,17 +265,26 @@ class _MapScreenState extends State<MapScreen>
     LatLng target;
     if (_routeValidated) {
       // Dead reckoning : extrapoler la position entre les mises à jour GPS
-      LatLng estimated = _currentPosition;
+      // On part toujours de _gpsAnchorPos (dernière position GPS reçue)
+      // pour éviter l'accumulation d'erreur entre les ticks.
+      LatLng estimated = _gpsAnchorPos;
       if (_lastGpsTime != null && _lastSpeedMs >= _stationarySpeedMs) {
         final secSinceGps =
             DateTime.now().difference(_lastGpsTime!).inMilliseconds / 1000.0;
         if (secSinceGps > 0.05 && secSinceGps < 2.0) {
           estimated = _projectPosition(
-            _currentPosition,
+            _gpsAnchorPos,
             _bearing,
             (_lastSpeedMs * secSinceGps).clamp(0.0, 40.0),
           );
         }
+      }
+      // Déplacer le marker de position à la position dead-reckoned (60fps, sans téléportation)
+      if ((estimated.latitude - _currentPosition.latitude).abs() > 1e-7 ||
+          (estimated.longitude - _currentPosition.longitude).abs() > 1e-7) {
+        setState(() {
+          _currentPosition = estimated;
+        });
       }
       target = _predictedFollowTarget(estimated, _bearing, _lastSpeedMs);
     } else {
@@ -333,7 +371,12 @@ class _MapScreenState extends State<MapScreen>
   }
 
   double _visibleMarkerBearing(double bearingDeg) {
-    return _shouldAutoRotate && _isFollowing ? 0.0 : bearingDeg;
+    // rotate:true applique une rotation CCW de camera.rotation au widget,
+    // déplaçant le "haut" à (360 - rotation)° CW depuis l'écran.
+    // En ajoutant ensuite CW bearingDeg, la flèche aboutit exactement dans
+    // la direction géographique bearingDeg, quelle que soit la rotation de carte.
+    // La soustraction (bearing - rotation) était une double-correction erronée.
+    return bearingDeg % 360.0;
   }
 
   void _rotateMapToBearing(double bearingDeg) {
@@ -406,6 +449,7 @@ class _MapScreenState extends State<MapScreen>
 
     setState(() {
       _currentPosition = displayPos;
+      _gpsAnchorPos = displayPos; // ancre pour le dead reckoning dans le ticker
       _bearing = bearing;
       _speedKmh = speedKmh;
 
@@ -451,61 +495,8 @@ class _MapScreenState extends State<MapScreen>
       _lastGpsTime = now;
       _lastGpsPos = pos;
 
-      _markers = [
-        ..._markers.where((m) => m.key != const ValueKey('current')),
-        Marker(
-          key: const ValueKey('current'),
-          point: displayPos,
-          width: 60,
-          height: 60,
-          rotate: true,
-          child: _routeValidated
-              ? _buildArrowMarker(_visibleMarkerBearing(bearing))
-              : Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    // Halo de précision (cercle externe semi-transparent)
-                    Container(
-                      width: 60,
-                      height: 60,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Colors.blue.withValues(alpha: 0.15),
-                        border: Border.all(
-                          color: Colors.blue.withValues(alpha: 0.25),
-                          width: 1,
-                        ),
-                      ),
-                    ),
-                    // Anneau blanc avec ombre
-                    Container(
-                      width: 22,
-                      height: 22,
-                      decoration: const BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Colors.white,
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black26,
-                            blurRadius: 6,
-                            offset: Offset(0, 2),
-                          ),
-                        ],
-                      ),
-                    ),
-                    // Point bleu central
-                    Container(
-                      width: 14,
-                      height: 14,
-                      decoration: const BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Color(0xFF1A73E8),
-                      ),
-                    ),
-                  ],
-                ),
-        ),
-      ];
+      // Le marker de position courante est construit dynamiquement dans build()
+      // via _buildCurrentMarker() pour permettre la mise à jour fluide à 60fps.
     });
     // La caméra est gérée par le ticker _onCameraFollowTick (dead reckoning 60fps)
 
@@ -957,59 +948,14 @@ class _MapScreenState extends State<MapScreen>
       _tripDistanceKm = 0.0;
       _lastGpsPos = null;
       _smoothedPos = null;
-      _markers = [
-        ..._markers.where(
-          (m) =>
-              m.key != const ValueKey('search') &&
-              m.key != const ValueKey('current'),
-        ),
-        Marker(
-          key: const ValueKey('current'),
-          point: _currentPosition,
-          width: 60,
-          height: 60,
-          child: Stack(
-            alignment: Alignment.center,
-            children: [
-              Container(
-                width: 60,
-                height: 60,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.blue.withValues(alpha: 0.15),
-                  border: Border.all(
-                    color: Colors.blue.withValues(alpha: 0.25),
-                    width: 1,
-                  ),
-                ),
-              ),
-              Container(
-                width: 22,
-                height: 22,
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Colors.white,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black26,
-                      blurRadius: 6,
-                      offset: Offset(0, 2),
-                    ),
-                  ],
-                ),
-              ),
-              Container(
-                width: 14,
-                height: 14,
-                decoration: const BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: Color(0xFF1A73E8),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ];
+      // Supprimer le marker de recherche ; le marker de position est géré dans build()
+      _markers = _markers
+          .where(
+            (m) =>
+                m.key != const ValueKey('search') &&
+                m.key != const ValueKey('current'),
+          )
+          .toList();
     });
     _mapController.move(_currentPosition, 15.0);
   }
@@ -1043,18 +989,7 @@ class _MapScreenState extends State<MapScreen>
       final route = _routeAlternatives[_selectedRouteIndex];
       _remainingDurationMin = route.durationMin;
       _remainingDistanceKm = route.distanceKm;
-      // Rebuild le marqueur en flèche immédiatement
-      _markers = [
-        ..._markers.where((m) => m.key != const ValueKey('current')),
-        Marker(
-          key: const ValueKey('current'),
-          point: _currentPosition,
-          width: 60,
-          height: 60,
-          rotate: true,
-          child: _buildArrowMarker(_visibleMarkerBearing(_bearing)),
-        ),
-      ];
+      // Le marker de position courante est construit dans build() via _buildCurrentMarker()
     });
     _cameraFollowZoom = 17.0;
     _prevCameraTickElapsed = null;
@@ -1078,6 +1013,59 @@ class _MapScreenState extends State<MapScreen>
     if (_routeValidated && _lastSpeedMs >= _minReliableHeadingSpeedMs) {
       _rotateMapToBearing(_bearing);
     }
+  }
+
+  // Construit le marker de position courante (utilisé directement dans build() à chaque frame)
+  Marker _buildCurrentMarker() {
+    return Marker(
+      key: const ValueKey('current'),
+      point: _currentPosition,
+      width: 60,
+      height: 60,
+      rotate: true,
+      child: _routeValidated
+          ? _buildArrowMarker(_visibleMarkerBearing(_bearing))
+          : Stack(
+              alignment: Alignment.center,
+              children: [
+                Container(
+                  width: 60,
+                  height: 60,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.blue.withValues(alpha: 0.15),
+                    border: Border.all(
+                      color: Colors.blue.withValues(alpha: 0.25),
+                      width: 1,
+                    ),
+                  ),
+                ),
+                Container(
+                  width: 22,
+                  height: 22,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Colors.white,
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black26,
+                        blurRadius: 6,
+                        offset: Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                ),
+                Container(
+                  width: 14,
+                  height: 14,
+                  decoration: const BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: Color(0xFF1A73E8),
+                  ),
+                ),
+              ],
+            ),
+    );
   }
 
   Widget _buildArrowMarker(double bearingDeg) {
@@ -1252,7 +1240,7 @@ class _MapScreenState extends State<MapScreen>
                 polylines: _buildPolylines,
                 hitNotifier: _polylineHitNotifier,
               ),
-              MarkerLayer(markers: _markers),
+              MarkerLayer(markers: [..._markers, _buildCurrentMarker()]),
             ],
           ),
 

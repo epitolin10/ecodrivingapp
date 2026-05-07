@@ -1,63 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/vehicle_profile.dart';
+import '../models/vehicle_preset.dart';
 import 'mapscreen.dart';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Préréglages par catégorie de véhicule
-// ─────────────────────────────────────────────────────────────────────────────
-class _VehiclePreset {
-  final String label;
-  final IconData icon;
-  final double cx;
-  final double frontalAreaM2;
-  final double defaultMassKg;
-  final double defaultPowerKw;
-
-  const _VehiclePreset({
-    required this.label,
-    required this.icon,
-    required this.cx,
-    required this.frontalAreaM2,
-    required this.defaultMassKg,
-    required this.defaultPowerKw,
-  });
-}
-
-const _presets = [
-  _VehiclePreset(
-    label: 'Citadine',
-    icon: Icons.directions_car_outlined,
-    cx: 0.32,
-    frontalAreaM2: 2.0,
-    defaultMassKg: 1100,
-    defaultPowerKw: 55,
-  ),
-  _VehiclePreset(
-    label: 'Berline',
-    icon: Icons.directions_car,
-    cx: 0.28,
-    frontalAreaM2: 2.2,
-    defaultMassKg: 1400,
-    defaultPowerKw: 85,
-  ),
-  _VehiclePreset(
-    label: 'SUV',
-    icon: Icons.airport_shuttle_outlined,
-    cx: 0.35,
-    frontalAreaM2: 2.6,
-    defaultMassKg: 1700,
-    defaultPowerKw: 110,
-  ),
-  _VehiclePreset(
-    label: 'Utilitaire',
-    icon: Icons.local_shipping_outlined,
-    cx: 0.38,
-    frontalAreaM2: 3.2,
-    defaultMassKg: 2000,
-    defaultPowerKw: 90,
-  ),
-];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen principal
@@ -122,7 +67,7 @@ class _VehicleSetupScreenState extends State<VehicleSetupScreen>
   // ── Navigation entre étapes ───────────────────────────────────────────────
 
   void _applyPreset(int index) {
-    final preset = _presets[index];
+    final preset = vehiclePresets[index];
     setState(() {
       _selectedPresetIndex = index;
       _massController.text = preset.defaultMassKg.toInt().toString();
@@ -189,7 +134,7 @@ class _VehicleSetupScreenState extends State<VehicleSetupScreen>
 
     setState(() => _isSaving = true);
 
-    final preset = _presets[_selectedPresetIndex!];
+    final preset = vehiclePresets[_selectedPresetIndex!];
     final double massKg =
         double.tryParse(_massController.text.replaceAll(',', '.')) ??
         preset.defaultMassKg;
@@ -471,9 +416,9 @@ class _VehicleSetupScreenState extends State<VehicleSetupScreen>
               crossAxisSpacing: 12,
               childAspectRatio: 2.1,
             ),
-            itemCount: _presets.length,
+            itemCount: vehiclePresets.length,
             itemBuilder: (context, i) {
-              final preset = _presets[i];
+              final preset = vehiclePresets[i];
               final isSelected = _selectedPresetIndex == i;
               return GestureDetector(
                 onTap: () => _applyPreset(i),
@@ -749,7 +694,7 @@ class _VehicleSetupScreenState extends State<VehicleSetupScreen>
     if (_selectedPresetIndex == null || _selectedFuelType == null) {
       return const SizedBox.shrink();
     }
-    final preset = _presets[_selectedPresetIndex!];
+    final preset = vehiclePresets[_selectedPresetIndex!];
     final massKg =
         double.tryParse(_massController.text) ?? preset.defaultMassKg;
     final powerKw =

@@ -4,40 +4,9 @@ import 'dart:io';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
+import '../models/route.dart';
 
-class RouteStep {
-  final String maneuverType;
-  final String modifier;
-  final String streetName;
-  final double distanceM;
-  final int durationSec;
-  final LatLng location;
-  final int? exitNumber;
-
-  RouteStep({
-    required this.maneuverType,
-    required this.modifier,
-    required this.streetName,
-    required this.distanceM,
-    required this.durationSec,
-    required this.location,
-    this.exitNumber,
-  });
-}
-
-class RouteResult {
-  final List<LatLng> points;
-  final double distanceKm;
-  final int durationMin;
-  final List<RouteStep> steps;
-
-  RouteResult({
-    required this.points,
-    required this.distanceKm,
-    required this.durationMin,
-    required this.steps,
-  });
-}
+export '../models/route.dart';
 
 class GpsService {
   /// Vérifie et demande les permissions de localisation.
